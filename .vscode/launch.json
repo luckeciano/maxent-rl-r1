@@ -3,14 +3,15 @@
     "configurations": [
         {
             "name": "Debug R1 Training",
-            "type": "python",
+            "type": "debugpy",
             "request": "launch",
             "program": "src/open_r1/grpo.py",
             "args": [
-                "--config", "recipes/Qwen2.5-0.5B-Instruct/grpo/config_oatcloud.yaml"
+                "--config", "recipes/Qwen2.5-0.5B-Instruct/grpo/config_oatcloud_token_entropy.yaml"
             ],
             "console": "integratedTerminal",
             "justMyCode": false,
+            "envFile": "${workspaceFolder}/.env"
         }
     ]
 }

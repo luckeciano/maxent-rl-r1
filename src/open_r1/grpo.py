@@ -16,13 +16,17 @@ import logging
 import os
 import sys
 from dataclasses import dataclass, field
+from typing import Any, Union
 
 import datasets
 import torch
+from torch import nn
 import transformers
 from datasets import load_dataset
 from transformers import set_seed
 from transformers.trainer_utils import get_last_checkpoint
+from accelerate.utils import broadcast_object_list, gather, gather_object, set_seed
+import wandb
 
 from open_r1.configs import GRPOConfig
 from open_r1.rewards import (
@@ -32,6 +36,7 @@ from open_r1.rewards import (
     get_code_format_reward,
     get_cosine_scaled_reward,
     get_repetition_penalty_reward,
+    get_token_entropy_reward,
     len_reward,
     reasoning_steps_reward,
     tag_count_reward,
@@ -40,6 +45,13 @@ from open_r1.utils import get_tokenizer
 from open_r1.utils.callbacks import get_callbacks
 from open_r1.utils.wandb_logging import init_wandb_training
 from trl import GRPOTrainer, ModelConfig, ScriptArguments, TrlParser, get_peft_config
+from trl.data_utils import apply_chat_template, is_conversational, maybe_apply_chat_template
+from trl.import_utils import is_rich_available
+from trl.models import unwrap_model_for_generation
+from trl.trainer.utils import (
+    pad,
+    print_prompt_completions_sample,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -52,7 +64,7 @@ class GRPOScriptArguments(ScriptArguments):
 
     Args:
         reward_funcs (`list[str]`):
-            List of reward functions. Possible values: 'accuracy', 'format', 'reasoning_steps', 'cosine', 'repetition_penalty', 'length', 'tag_count', 'code', 'code_format'.
+            List of reward functions. Possible values: 'accuracy', 'format', 'reasoning_steps', 'cosine', 'repetition_penalty', 'length', 'tag_count', 'code', 'code_format', 'token_entropy'.
         cosine_min_value_wrong (`float`):
             Minimum reward for cosine scaling for wrong answers.
         cosine_max_value_wrong (`float`):
@@ -65,12 +77,16 @@ class GRPOScriptArguments(ScriptArguments):
             Maximum length for cosine scaling.
         code_language (`str`):
             Language for code format reward.
+        token_entropy_top_k (`int`):
+            Number of top tokens to consider for entropy calculation.
+        token_entropy_top_p (`float`):
+            Cumulative probability threshold for top-p sampling in entropy calculation.
     """
 
     reward_funcs: list[str] = field(
         default_factory=lambda: ["accuracy", "format", "tag_count"],
         metadata={
-            "help": "List of reward functions. Possible values: 'accuracy', 'format', 'reasoning_steps', 'cosine', 'repetition_penalty', 'length', tag_count', 'code', 'code_format'"
+            "help": "List of reward functions. Possible values: 'accuracy', 'format', 'reasoning_steps', 'cosine', 'repetition_penalty', 'length', tag_count', 'code', 'code_format', 'token_entropy'"
         },
     )
     cosine_min_value_wrong: float = field(
@@ -108,6 +124,233 @@ class GRPOScriptArguments(ScriptArguments):
             "choices": ["python", "javascript", "r", "java", "bash"],
         },
     )
+    token_entropy_top_k: int = field(
+        default=50,
+        metadata={"help": "Number of top tokens to consider for entropy calculation"},
+    )
+    token_entropy_top_p: float = field(
+        default=0.9,
+        metadata={"help": "Cumulative probability threshold for top-p sampling in entropy calculation"},
+    )
+
+
+class GRPOEntropyTrainer(GRPOTrainer):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    # override the _generate_and_score_completions method to pass logprobs to the entropy reward function
+    def _generate_and_score_completions(
+        self, inputs: dict[str, Union[torch.Tensor, Any]]
+    ) -> dict[str, Union[torch.Tensor, Any]]:
+        print(f"inputs: {inputs}")
+        device = self.accelerator.device
+        prompts = [x["prompt"] for x in inputs]
+        prompts_text = [maybe_apply_chat_template(example, self.processing_class)["prompt"] for example in inputs]
+        prompt_inputs = self.processing_class(
+            prompts_text, return_tensors="pt", padding=True, padding_side="left", add_special_tokens=False
+        )
+        prompt_inputs = super()._prepare_inputs(prompt_inputs)
+        prompt_ids, prompt_mask = prompt_inputs["input_ids"], prompt_inputs["attention_mask"]
+
+        if self.max_prompt_length is not None:
+            prompt_ids = prompt_ids[:, -self.max_prompt_length :]
+            prompt_mask = prompt_mask[:, -self.max_prompt_length :]
+
+        # Generate completions using either vLLM or regular generation
+        if self.args.use_vllm:
+            # First, have main process load weights if needed
+            if self.state.global_step != self._last_loaded_step:
+                self._move_model_to_vllm()
+                self._last_loaded_step = self.state.global_step
+
+            # Generate completions using vLLM: gather all prompts and use them in a single call in the main process
+            all_prompts_text = gather_object(prompts_text)
+            if self.accelerator.is_main_process:
+                # Since 'prompts' contains 'num_generations' duplicates, we first take unique prompts, and generate
+                # num_generations outputs for each one. This is faster than generating outputs for each duplicate
+                # prompt individually.
+                ordered_set_of_prompts = list(dict.fromkeys(all_prompts_text))
+                all_outputs = self.llm.generate(
+                    ordered_set_of_prompts, sampling_params=self.sampling_params, use_tqdm=False
+                )
+                completion_ids = []
+                for outputs in all_outputs:
+                    for output in outputs.outputs:
+                        completion_ids.append(output.token_ids)
+            else:
+                completion_ids = [None] * len(all_prompts_text)
+            # Broadcast the completions from the main process to all processes, ensuring each process receives its
+            # corresponding slice.
+            completion_ids = broadcast_object_list(completion_ids, from_process=0)
+            process_slice = slice(
+                self.accelerator.process_index * len(prompts),
+                (self.accelerator.process_index + 1) * len(prompts),
+            )
+            completion_ids = completion_ids[process_slice]
+
+            # Pad the completions, and concatenate them with the prompts
+            completion_ids = [torch.tensor(ids, device=device) for ids in completion_ids]
+            completion_ids = pad(completion_ids, padding_value=self.processing_class.pad_token_id)
+            prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)
+        else:
+            # Regular generation path
+            with unwrap_model_for_generation(self.model, self.accelerator) as unwrapped_model:
+                prompt_completion_ids = unwrapped_model.generate(
+                    prompt_ids, attention_mask=prompt_mask, generation_config=self.generation_config
+                )
+
+            # Compute prompt length and extract completion ids
+            prompt_length = prompt_ids.size(1)
+            prompt_ids = prompt_completion_ids[:, :prompt_length]
+            completion_ids = prompt_completion_ids[:, prompt_length:]
+
+        # Mask everything after the first EOS token
+        is_eos = completion_ids == self.processing_class.eos_token_id
+        eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=device)
+        eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
+        sequence_indices = torch.arange(is_eos.size(1), device=device).expand(is_eos.size(0), -1)
+        completion_mask = (sequence_indices <= eos_idx.unsqueeze(1)).int()
+
+        # Concatenate prompt_mask with completion_mask for logit computation
+        attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)  # (B, P+C)
+
+        logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
+
+        with torch.inference_mode():
+            # When using num_iterations == 1, old_per_token_logps == per_token_logps, so we can skip it's
+            # computation here, and use per_token_logps.detach() instead.
+            if self.num_iterations > 1:
+                old_per_token_logps = self._get_per_token_logps(
+                    self.model, prompt_completion_ids, attention_mask, logits_to_keep
+                )
+            else:
+                old_per_token_logps = None
+
+            if self.beta == 0.0:
+                ref_per_token_logps = None
+            elif self.ref_model is not None:
+                ref_per_token_logps = self._get_per_token_logps(
+                    self.ref_model, prompt_completion_ids, attention_mask, logits_to_keep
+                )
+            else:
+                with self.accelerator.unwrap_model(self.model).disable_adapter():
+                    ref_per_token_logps = self._get_per_token_logps(
+                        self.model, prompt_completion_ids, attention_mask, logits_to_keep
+                    )
+
+        # Decode the generated completions
+        completions_text = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
+        if is_conversational(inputs[0]):
+            completions = []
+            for prompt, completion in zip(prompts, completions_text):
+                bootstrap = prompt.pop()["content"] if prompt[-1]["role"] == "assistant" else ""
+                completions.append([{"role": "assistant", "content": bootstrap + completion}])
+        else:
+            completions = completions_text
+
+        rewards_per_func = torch.zeros(len(prompts), len(self.reward_funcs), device=device)
+        for i, (reward_func, reward_processing_class) in enumerate(
+            zip(self.reward_funcs, self.reward_processing_classes)
+        ):
+            if isinstance(reward_func, nn.Module):  # Module instead of PretrainedModel for compat with compiled models
+                if is_conversational(inputs[0]):
+                    messages = [{"messages": p + c} for p, c in zip(prompts, completions)]
+                    texts = [apply_chat_template(x, reward_processing_class)["text"] for x in messages]
+                else:
+                    texts = [p + c for p, c in zip(prompts, completions)]
+                reward_inputs = reward_processing_class(
+                    texts, return_tensors="pt", padding=True, padding_side="right", add_special_tokens=False
+                )
+                reward_inputs = super()._prepare_inputs(reward_inputs)
+                with torch.inference_mode():
+                    rewards_per_func[:, i] = reward_func(**reward_inputs).logits[:, 0]  # Shape (B*G,)
+            elif "entropy" in reward_func.__name__:
+                # Pass logprobs to the entropy reward function
+                output_reward_func = reward_func(prompts=prompts, completions=completions, logprobs=old_per_token_logps)
+                rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
+            else:
+                # Repeat all input columns (but "prompt" and "completion") to match the number of generations
+                keys = [key for key in inputs[0] if key not in ["prompt", "completion"]]
+                reward_kwargs = {key: [example[key] for example in inputs] for key in keys}
+                output_reward_func = reward_func(prompts=prompts, completions=completions, **reward_kwargs)
+                rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
+
+        # Gather the reward per function: this part is crucial, because the rewards are normalized per group and the
+        # completions may be distributed across processes
+        rewards_per_func = gather(rewards_per_func)
+
+        # Apply weights to each reward function's output and sum
+        rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).sum(dim=1)
+
+        # Compute grouped-wise rewards
+        mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)
+        std_grouped_rewards = rewards.view(-1, self.num_generations).std(dim=1)
+
+        # Normalize the rewards to compute the advantages
+        mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
+        std_grouped_rewards = std_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
+        advantages = (rewards - mean_grouped_rewards) / (std_grouped_rewards + 1e-4)
+
+        # Slice to keep only the local part of the data
+        process_slice = slice(
+            self.accelerator.process_index * len(prompts),
+            (self.accelerator.process_index + 1) * len(prompts),
+        )
+        advantages = advantages[process_slice]
+
+        # Log the metrics
+        mode = "eval" if self.control.should_evaluate else "train"
+
+        completion_length = self.accelerator.gather_for_metrics(completion_mask.sum(1)).float().mean().item()
+        self._metrics[mode]["completion_length"].append(completion_length)
+
+        reward_per_func = rewards_per_func.mean(0)
+        for i, reward_func in enumerate(self.reward_funcs):
+            if isinstance(reward_func, nn.Module):  # Module instead of PretrainedModel for compat with compiled models
+                reward_func_name = reward_func.config._name_or_path.split("/")[-1]
+            else:
+                reward_func_name = reward_func.__name__
+            self._metrics[mode][f"rewards/{reward_func_name}"].append(reward_per_func[i].item())
+
+        self._metrics[mode]["reward"].append(rewards.mean().item())
+        self._metrics[mode]["reward_std"].append(std_grouped_rewards.mean().item())
+
+        if self.log_completions and self.state.global_step % self.args.logging_steps == 0:
+            prompts_to_log = gather_object(prompts_text)
+            completions_to_log = gather_object(completions_text)
+            rewards_to_log = rewards.tolist()
+
+            if self.accelerator.is_main_process:
+                if is_rich_available():
+                    print_prompt_completions_sample(
+                        prompts_to_log,
+                        completions_to_log,
+                        rewards_to_log,
+                        self.state.global_step,
+                    )
+                if self.args.report_to and "wandb" in self.args.report_to and wandb.run is not None:
+                    import pandas as pd
+
+                    # For logging
+                    table = {
+                        "step": [str(self.state.global_step)] * len(rewards),
+                        "prompt": prompts_to_log,
+                        "completion": completions_to_log,
+                        "reward": rewards.tolist(),
+                    }
+                    df = pd.DataFrame(table)
+                    wandb.log({"completions": wandb.Table(dataframe=df)})
+
+        return {
+            "prompt_ids": prompt_ids,
+            "prompt_mask": prompt_mask,
+            "completion_ids": completion_ids,
+            "completion_mask": completion_mask,
+            "old_per_token_logps": old_per_token_logps,
+            "ref_per_token_logps": ref_per_token_logps,
+            "advantages": advantages,
+        }
+
 
 
 def main(script_args, training_args, model_args):
@@ -156,8 +399,8 @@ def main(script_args, training_args, model_args):
     ################
     tokenizer = get_tokenizer(model_args, training_args)
 
-    # Get reward functions
-    REWARD_FUNCS_REGISTRY = {
+    # Map reward functions to their implementations
+    reward_mapping = {
         "accuracy": accuracy_reward,
         "format": format_reward,
         "reasoning_steps": reasoning_steps_reward,
@@ -173,11 +416,15 @@ def main(script_args, training_args, model_args):
             max_penalty=script_args.repetition_max_penalty,
         ),
         "length": len_reward,
+        "tag_count": tag_count_reward,
         "code": code_reward,
         "code_format": get_code_format_reward(language=script_args.code_language),
-        "tag_count": tag_count_reward,
+        "token_entropy": get_token_entropy_reward(
+            top_k=script_args.token_entropy_top_k,
+            top_p=script_args.token_entropy_top_p,
+        ),
     }
-    reward_funcs = [REWARD_FUNCS_REGISTRY[func] for func in script_args.reward_funcs]
+    reward_funcs = [reward_mapping[func] for func in script_args.reward_funcs]
 
     # Format into conversation
     def make_conversation(example):
@@ -211,7 +458,7 @@ def main(script_args, training_args, model_args):
     #############################
     # Initialize the GRPO trainer
     #############################
-    trainer = GRPOTrainer(
+    trainer = GRPOEntropyTrainer(
         model=model_args.model_name_or_path,
         reward_funcs=reward_funcs,
         args=training_args,

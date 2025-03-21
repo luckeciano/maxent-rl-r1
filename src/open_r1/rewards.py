@@ -5,6 +5,8 @@ import json
 import math
 import re
 from typing import Dict
+import warnings
+import torch
 
 from latex2sympy2_extended import NormalizationConfig
 from math_verify import LatexExtractionConfig, parse, verify
@@ -444,3 +446,72 @@ async def run_script(sbx: AsyncSandbox, script: str, language: str) -> float:
         return float(execution.text)
     except (TypeError, ValueError):
         return 0.0
+
+
+def get_token_entropy_reward(top_k: int = 50, top_p: float = 0.9):
+    """Reward function that calculates token entropy given top-k and top-p sampling parameters.
+    
+    This reward encourages diversity in token selection while conforming to the maximum entropy RL objective.
+    Higher entropy means more diverse token selection, which is rewarded.
+    
+    Args:
+        top_k (int): Number of top tokens to consider for entropy calculation
+        top_p (float): Cumulative probability threshold for top-p sampling
+        
+    Returns:
+        A reward function that takes completions and returns a list of rewards
+    """
+    def token_entropy_reward(completions, logprobs=None, **kwargs) -> list[float]:
+        """Calculate entropy reward using token log probabilities.
+        
+        Args:
+            completions: List of model completions (unused)
+            logprobs: List of token log probabilities for each completion
+            **kwargs: Additional arguments
+            
+        Returns:
+            List of normalized entropy rewards
+        """
+        print(f"logprobs: {logprobs}")
+        if logprobs is None:
+            # warning
+            warnings.warn("logprobs is None, returning 0.0 rewards for all completions")
+            return [0.0] * len(completions)
+            
+        rewards = []
+        for logps in logprobs:
+            # Convert logprobs to probs
+            probs = torch.exp(logps)
+            
+            # Apply top-k filtering
+            if top_k > 0:
+                top_k_values, top_k_indices = torch.topk(probs, k=min(top_k, len(probs)))
+                mask = torch.zeros_like(probs)
+                mask[top_k_indices] = 1
+                probs = probs * mask
+                probs = probs / probs.sum()
+            
+            # Apply top-p filtering
+            if top_p < 1.0:
+                sorted_probs, sorted_indices = torch.sort(probs, descending=True)
+                cumsum = torch.cumsum(sorted_probs, dim=0)
+                top_p_idx = torch.where(cumsum >= top_p)[0][0]
+                mask = torch.zeros_like(probs)
+                mask[sorted_indices[:top_p_idx + 1]] = 1
+                probs = probs * mask
+                probs = probs / probs.sum()
+            
+            # Calculate entropy
+            epsilon = 1e-10
+            probs = probs + epsilon
+            entropy = -torch.sum(probs * torch.log(probs))
+            
+            # Normalize entropy to [0, 1] range
+            max_entropy = math.log(len(probs))
+            normalized_entropy = float(entropy / max_entropy if max_entropy > 0 else 0)
+            
+            rewards.append(normalized_entropy)
+            
+        return rewards
+    
+    return token_entropy_reward
