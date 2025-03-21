@@ -23,7 +23,7 @@ import torch
 from torch import nn
 import transformers
 from datasets import load_dataset
-from transformers import set_seed
+from transformers import set_seed, Trainer
 from transformers.trainer_utils import get_last_checkpoint
 from accelerate.utils import broadcast_object_list, gather, gather_object, set_seed
 import wandb
@@ -142,14 +142,14 @@ class GRPOEntropyTrainer(GRPOTrainer):
     def _generate_and_score_completions(
         self, inputs: dict[str, Union[torch.Tensor, Any]]
     ) -> dict[str, Union[torch.Tensor, Any]]:
-        print(f"inputs: {inputs}")
         device = self.accelerator.device
+        print(inputs)
         prompts = [x["prompt"] for x in inputs]
         prompts_text = [maybe_apply_chat_template(example, self.processing_class)["prompt"] for example in inputs]
         prompt_inputs = self.processing_class(
             prompts_text, return_tensors="pt", padding=True, padding_side="left", add_special_tokens=False
         )
-        prompt_inputs = super()._prepare_inputs(prompt_inputs)
+        prompt_inputs = Trainer._prepare_inputs(self, prompt_inputs)  # Call Trainer's _prepare_inputs directly
         prompt_ids, prompt_mask = prompt_inputs["input_ids"], prompt_inputs["attention_mask"]
 
         if self.max_prompt_length is not None:
@@ -219,12 +219,12 @@ class GRPOEntropyTrainer(GRPOTrainer):
         with torch.inference_mode():
             # When using num_iterations == 1, old_per_token_logps == per_token_logps, so we can skip it's
             # computation here, and use per_token_logps.detach() instead.
-            if self.num_iterations > 1:
-                old_per_token_logps = self._get_per_token_logps(
-                    self.model, prompt_completion_ids, attention_mask, logits_to_keep
-                )
-            else:
-                old_per_token_logps = None
+            # if self.num_iterations > 1:
+            old_per_token_logps = self._get_per_token_logps(
+                self.model, prompt_completion_ids, attention_mask, logits_to_keep
+            )
+            # else:
+                # old_per_token_logps = None
 
             if self.beta == 0.0:
                 ref_per_token_logps = None
@@ -261,10 +261,13 @@ class GRPOEntropyTrainer(GRPOTrainer):
                 reward_inputs = reward_processing_class(
                     texts, return_tensors="pt", padding=True, padding_side="right", add_special_tokens=False
                 )
-                reward_inputs = super()._prepare_inputs(reward_inputs)
+                reward_inputs = Trainer._prepare_inputs(reward_inputs)
                 with torch.inference_mode():
                     rewards_per_func[:, i] = reward_func(**reward_inputs).logits[:, 0]  # Shape (B*G,)
             elif "entropy" in reward_func.__name__:
+                # Repeat all input columns (but "prompt" and "completion") to match the number of generations
+                keys = [key for key in inputs[0] if key not in ["prompt", "completion"]]
+                reward_kwargs = {key: [example[key] for example in inputs] for key in keys}
                 # Pass logprobs to the entropy reward function
                 output_reward_func = reward_func(prompts=prompts, completions=completions, logprobs=old_per_token_logps)
                 rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
@@ -459,6 +462,7 @@ def main(script_args, training_args, model_args):
     # Initialize the GRPO trainer
     #############################
     trainer = GRPOEntropyTrainer(
+    # trainer = GRPOTrainer(
         model=model_args.model_name_or_path,
         reward_funcs=reward_funcs,
         args=training_args,
