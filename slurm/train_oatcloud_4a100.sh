@@ -25,12 +25,12 @@ export PYTHONWARNINGS="ignore::DeprecationWarning"
 /scratch-ssd/oatml/run_locked.sh /scratch-ssd/oatml/miniconda3/bin/conda-env update -f ~/maxent-rl-r1/environment.yml
 source /scratch-ssd/oatml/miniconda3/bin/activate maxent-r1
 
+# Installing flash-attn
+pip install flash-attn --no-build-isolation
+
 cd ~/maxent-rl-r1
 pip install --no-cache-dir --upgrade pip
 pip install --no-cache-dir -e ".[dev]"
-
-# Installing flash-attn
-pip install flash-attn --no-build-isolation
 
 echo $TMPDIR
 
@@ -40,11 +40,11 @@ huggingface-cli login --token $HUGGINGFACE_WRITETOKEN
 
 echo "START TIME: $(date)"
 
-MODEL=Qwen2.5-Math-7B
-TASK=grpo
-CONFIG_SUFFIX=oatcloud
-ACCELERATOR=zero3_oatcloud
-OPTIONAL_ARGS=
+MODEL=$1 #e.g., Qwen2.5-Math-7B
+TASK=$2 #e.g., grpo
+CONFIG_SUFFIX=$3 #e.g., oatcloud
+ACCELERATOR=$4 #e.g., zero2_oatcloud
+OPTIONAL_ARGS=""
 
 # Training setup
 NUM_NODES=$SLURM_NNODES
@@ -93,9 +93,6 @@ echo "ACCELERATOR: $ACCELERATOR"
 echo "TASK: $TASK"
 echo "SLURM_PROCID: $SLURM_PROCID"
 
-# Add these environment variables before the accelerate launch command
-export CUDA_VISIBLE_DEVICES=$(nvidia-smi --query-gpu=index --format=csv,noheader | tr '\n' ',' | sed 's/,$//')
-
 export CMD=" \
     src/open_r1/$TASK.py --config $CONFIG_FILE $OPTIONAL_ARGS
     "
@@ -118,14 +115,10 @@ export LAUNCHER="HF_HUB_ENABLE_HF_TRANSFER=1 ACCELERATE_LOG_LEVEL=info TRANSFORM
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 export NCCL_DEBUG=WARN
 export NCCL_ASYNC_ERROR_HANDLING=1
-export NCCL_BLOCKING_WAIT=1
+
+# Need to disable P2P to avoid hanging broadcast in A100s
 export NCCL_P2P_DISABLE=1
-export CUDA_LAUNCH_BLOCKING=1
-# export NCCL_DEBUG=INFO
-# export NCCL_DEBUG_SUBSYS=COLL
-# export NCCL_SOCKET_NTHREADS=1
-# export NCCL_NSOCKS_PERTHREAD=1
-# export CUDA_LAUNCH_BLOCKING=1
+
 
 # srun error handling:
 # --wait=60: wait 60 sec after the first task terminates before terminating all remaining tasks
