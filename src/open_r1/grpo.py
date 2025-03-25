@@ -424,7 +424,7 @@ def main(script_args, training_args, model_args):
         "tag_count": tag_count_reward,
         "code": code_reward,
         "code_format": get_code_format_reward(language=script_args.code_language),
-        "token_entropy": get_token_entropy_reward
+        "token_entropy": get_token_entropy_reward(reduction=script_args.token_entropy_reduction)
     }
     reward_funcs = [reward_mapping[func] for func in script_args.reward_funcs]
 
