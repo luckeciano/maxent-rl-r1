@@ -310,6 +310,16 @@ class GRPOEntropyTrainer(GRPOTrainer):
         self._metrics[mode]["reward"].append(rewards.mean().item())
         self._metrics[mode]["reward_std"].append(std_grouped_rewards.mean().item())
 
+        # save logprobs to wandb
+        if old_per_token_logps is not None:
+            mean_logprobs = self.accelerator.gather_for_metrics(old_per_token_logps.mean(1)).float().mean().item()
+            sum_logprobs = self.accelerator.gather_for_metrics(old_per_token_logps.sum(1)).float().mean().item()
+            print(f"mean_logprobs: {mean_logprobs}, sum_logprobs: {sum_logprobs}")
+            self._metrics[mode]["logprobs/mean"].append(mean_logprobs)
+            self._metrics[mode]["logprobs/sum"].append(sum_logprobs)
+
+
+
         if self.log_completions and self.state.global_step % self.args.logging_steps == 0:
             prompts_to_log = gather_object(prompts_text)
             completions_to_log = gather_object(completions_text)
