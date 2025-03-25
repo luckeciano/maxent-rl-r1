@@ -36,7 +36,7 @@ from open_r1.rewards import (
     get_code_format_reward,
     get_cosine_scaled_reward,
     get_repetition_penalty_reward,
-    get_token_entropy_reward,
+    token_entropy_reward,
     len_reward,
     reasoning_steps_reward,
     tag_count_reward,
@@ -77,10 +77,6 @@ class GRPOScriptArguments(ScriptArguments):
             Maximum length for cosine scaling.
         code_language (`str`):
             Language for code format reward.
-        token_entropy_top_k (`int`):
-            Number of top tokens to consider for entropy calculation.
-        token_entropy_top_p (`float`):
-            Cumulative probability threshold for top-p sampling in entropy calculation.
     """
 
     reward_funcs: list[str] = field(
@@ -216,6 +212,7 @@ class GRPOEntropyTrainer(GRPOTrainer):
 
         logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
 
+        # TODO extract hidden states here too for other reward functions
         with torch.inference_mode():
             # When using num_iterations == 1, old_per_token_logps == per_token_logps, so we can skip it's
             # computation here, and use per_token_logps.detach() instead.
@@ -269,7 +266,7 @@ class GRPOEntropyTrainer(GRPOTrainer):
                 keys = [key for key in inputs[0] if key not in ["prompt", "completion"]]
                 reward_kwargs = {key: [example[key] for example in inputs] for key in keys}
                 # Pass logprobs to the entropy reward function
-                output_reward_func = reward_func(prompts=prompts, completions=completions, logprobs=old_per_token_logps)
+                output_reward_func = reward_func(prompts=prompts, completions=completions, logprobs=old_per_token_logps, completion_ids=completion_ids)
                 rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
             else:
                 # Repeat all input columns (but "prompt" and "completion") to match the number of generations
@@ -422,10 +419,7 @@ def main(script_args, training_args, model_args):
         "tag_count": tag_count_reward,
         "code": code_reward,
         "code_format": get_code_format_reward(language=script_args.code_language),
-        "token_entropy": get_token_entropy_reward(
-            top_k=script_args.token_entropy_top_k,
-            top_p=script_args.token_entropy_top_p,
-        ),
+        "token_entropy": token_entropy_reward
     }
     reward_funcs = [reward_mapping[func] for func in script_args.reward_funcs]
 
