@@ -314,7 +314,6 @@ class GRPOEntropyTrainer(GRPOTrainer):
         if old_per_token_logps is not None:
             mean_logprobs = self.accelerator.gather_for_metrics(old_per_token_logps.mean(1)).float().mean().item()
             sum_logprobs = self.accelerator.gather_for_metrics(old_per_token_logps.sum(1)).float().mean().item()
-            print(f"mean_logprobs: {mean_logprobs}, sum_logprobs: {sum_logprobs}")
             self._metrics[mode]["logprobs/mean"].append(mean_logprobs)
             self._metrics[mode]["logprobs/sum"].append(sum_logprobs)
 
