@@ -36,7 +36,7 @@ from open_r1.rewards import (
     get_code_format_reward,
     get_cosine_scaled_reward,
     get_repetition_penalty_reward,
-    token_entropy_reward,
+    get_token_entropy_reward,
     len_reward,
     reasoning_steps_reward,
     tag_count_reward,
@@ -120,13 +120,9 @@ class GRPOScriptArguments(ScriptArguments):
             "choices": ["python", "javascript", "r", "java", "bash"],
         },
     )
-    token_entropy_top_k: int = field(
-        default=50,
-        metadata={"help": "Number of top tokens to consider for entropy calculation"},
-    )
-    token_entropy_top_p: float = field(
-        default=0.9,
-        metadata={"help": "Cumulative probability threshold for top-p sampling in entropy calculation"},
+    token_entropy_reduction: str = field(
+        default="sum",
+        metadata={"help": "Reduction method for token entropy reward. Possible values: 'sum', 'mean'"},
     )
 
 
@@ -139,7 +135,6 @@ class GRPOEntropyTrainer(GRPOTrainer):
         self, inputs: dict[str, Union[torch.Tensor, Any]]
     ) -> dict[str, Union[torch.Tensor, Any]]:
         device = self.accelerator.device
-        print(inputs)
         prompts = [x["prompt"] for x in inputs]
         prompts_text = [maybe_apply_chat_template(example, self.processing_class)["prompt"] for example in inputs]
         prompt_inputs = self.processing_class(
@@ -419,7 +414,7 @@ def main(script_args, training_args, model_args):
         "tag_count": tag_count_reward,
         "code": code_reward,
         "code_format": get_code_format_reward(language=script_args.code_language),
-        "token_entropy": token_entropy_reward
+        "token_entropy": get_token_entropy_reward
     }
     reward_funcs = [reward_mapping[func] for func in script_args.reward_funcs]
 

@@ -447,23 +447,37 @@ async def run_script(sbx: AsyncSandbox, script: str, language: str) -> float:
     except (TypeError, ValueError):
         return 0.0
 
-
-def token_entropy_reward(completions, logprobs=None, **kwargs) -> list[float]:
-    """Calculate entropy reward using token log probabilities.
-    
-    Args:
-        completions: List of model completions 
-        logprobs: List of token log probabilities for each completion (shape: (B, T))
-        **kwargs: Additional arguments
-        
-    Returns:
-        List of normalized entropy rewards
+def get_token_entropy_reward(reduction: str = "sum"):
     """
-    if logprobs is None:
-        # warning
-        warnings.warn("logprobs is None, returning 0.0 rewards for all completions")
-        return [0.0] * len(completions)
+    Get a token entropy reward function that can be used to calculate the entropy of the tokens in a completion.
 
-    # max ent RL for policy gradients is just the sum of the logprobs of the completion tokens
-    # so we just return the sum of the logprobs
-    return torch.sum(-logprobs, dim=1).tolist()
+    Args:
+        reduction: The reduction method to use for the entropy reward.
+    """       
+
+    def token_entropy_reward(completions, logprobs=None, **kwargs) -> list[float]:
+        """Calculate entropy reward using token log probabilities.
+        
+        Args:
+            completions: List of model completions 
+            logprobs: List of token log probabilities for each completion (shape: (B, T))
+            **kwargs: Additional arguments
+            
+        Returns:
+            List of normalized entropy rewards
+        """
+        if logprobs is None:
+            # warning
+            warnings.warn("logprobs is None, returning 0.0 rewards for all completions")
+            return [0.0] * len(completions)
+
+        # max ent RL for policy gradients is just the sum of the logprobs of the completion tokens
+        # so we just return the sum of the logprobs
+        if reduction == "sum":
+            return torch.sum(-logprobs, dim=1).tolist()
+        elif reduction == "mean":
+            return torch.mean(-logprobs, dim=1).tolist()
+        else:
+            raise ValueError(f"Invalid reduction method: {reduction}")
+
+    return token_entropy_reward

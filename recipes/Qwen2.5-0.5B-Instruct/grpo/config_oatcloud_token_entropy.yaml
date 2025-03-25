@@ -47,6 +47,7 @@ reward_funcs:
 - accuracy
 - format
 - token_entropy
+token_entropy_reduction: sum
 reward_weights:
 - 1.0
 - 1.0
