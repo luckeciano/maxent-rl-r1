@@ -40,6 +40,7 @@ from open_r1.rewards import (
     len_reward,
     reasoning_steps_reward,
     tag_count_reward,
+    get_embedding_entropy_reward,
 )
 from open_r1.utils import get_tokenizer
 from open_r1.utils.callbacks import get_callbacks
@@ -51,6 +52,7 @@ from trl.models import unwrap_model_for_generation
 from trl.trainer.utils import (
     pad,
     print_prompt_completions_sample,
+    selective_log_softmax,
 )
 
 
@@ -64,7 +66,7 @@ class GRPOScriptArguments(ScriptArguments):
 
     Args:
         reward_funcs (`list[str]`):
-            List of reward functions. Possible values: 'accuracy', 'format', 'reasoning_steps', 'cosine', 'repetition_penalty', 'length', 'tag_count', 'code', 'code_format', 'token_entropy'.
+            List of reward functions. Possible values: 'accuracy', 'format', 'reasoning_steps', 'cosine', 'repetition_penalty', 'length', 'tag_count', 'code', 'code_format', 'token_entropy', 'embedding_similarity'.
         cosine_min_value_wrong (`float`):
             Minimum reward for cosine scaling for wrong answers.
         cosine_max_value_wrong (`float`):
@@ -82,7 +84,7 @@ class GRPOScriptArguments(ScriptArguments):
     reward_funcs: list[str] = field(
         default_factory=lambda: ["accuracy", "format", "tag_count"],
         metadata={
-            "help": "List of reward functions. Possible values: 'accuracy', 'format', 'reasoning_steps', 'cosine', 'repetition_penalty', 'length', tag_count', 'code', 'code_format', 'token_entropy'"
+            "help": "List of reward functions. Possible values: 'accuracy', 'format', 'reasoning_steps', 'cosine', 'repetition_penalty', 'length', tag_count', 'code', 'code_format', 'token_entropy', 'embedding_entropy'"
         },
     )
     cosine_min_value_wrong: float = field(
@@ -124,11 +126,59 @@ class GRPOScriptArguments(ScriptArguments):
         default="sum",
         metadata={"help": "Reduction method for token entropy reward. Possible values: 'sum', 'mean'"},
     )
+    embedding_entropy_reduction: str = field(
+        default="mean",
+        metadata={"help": "Reduction method for embedding entropy reward. Possible values: 'sum', 'mean'"},
+    )
+    embedding_entropy_similarity: str = field(
+        default="cosine",
+        metadata={"help": "Similarity metric for embedding entropy reward. Possible values: 'cosine', 'euclidean'"},
+    )
+    embedding_entropy_token: str = field(
+        default="last",
+        metadata={"help": "Token to use for embedding entropy reward. Possible values: 'last', 'mean', 'concat'"},
+    )
+    embedding_entropy_hidden_state_reduction: str = field(
+        default=[-1, -1],
+        metadata={"help": "Hidden states used for embedding entropy reward. Format: [start_layer, end_layer]"},
+    )
 
 
 class GRPOEntropyTrainer(GRPOTrainer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+
+    def _get_per_token_logps(self, model, input_ids, attention_mask, logits_to_keep, return_hidden_states=False):
+        """Get per-token log probabilities and embeddings from the model.
+        
+        Args:
+            model: The model to get log probabilities and embeddings from
+            input_ids: Input token IDs
+            attention_mask: Attention mask
+            logits_to_keep: Number of logits to keep from the end
+            
+        Returns:
+            tuple: (log_probs, embeddings) where:
+                - log_probs: Per-token log probabilities (B, L)
+                - embeddings: Last hidden state embeddings (B, L, H)
+        """
+        # We add 1 to `logits_to_keep` because the last logits of the sequence is later excluded
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask, logits_to_keep=logits_to_keep + 1, output_hidden_states=True)
+        logits = outputs.logits
+        logits = logits[:, :-1, :]  # (B, L-1, V), exclude the last logit: it corresponds to the next token pred
+
+        input_ids = input_ids[:, -logits_to_keep:]
+        # For transformers<=4.48, logits_to_keep argument isn't supported, so here we drop logits ourselves.
+        # See https://github.com/huggingface/trl/issues/2770
+        logits = logits[:, -logits_to_keep:]
+        log_probs = selective_log_softmax(logits, input_ids)  # compute logprobs for the input tokens
+        if return_hidden_states:
+            print(len(outputs.hidden_states), len(outputs.hidden_states[-1]), outputs.hidden_states[-1][0].shape)
+            # hidden states are (num_generated_tokens, num_layers, batch, sequence, hidden)
+            embeddings = torch.stack([x for x in outputs.hidden_states[-1]])  # (num_layers, B, L, H)
+            return log_probs, embeddings
+        else:
+            return log_probs
 
     # override the _generate_and_score_completions method to pass logprobs to the entropy reward function
     def _generate_and_score_completions(
@@ -212,8 +262,8 @@ class GRPOEntropyTrainer(GRPOTrainer):
             # When using num_iterations == 1, old_per_token_logps == per_token_logps, so we can skip it's
             # computation here, and use per_token_logps.detach() instead.
             # if self.num_iterations > 1:
-            old_per_token_logps = self._get_per_token_logps(
-                self.model, prompt_completion_ids, attention_mask, logits_to_keep
+            old_per_token_logps, old_last_token_embeddings = self._get_per_token_logps(
+                self.model, prompt_completion_ids, attention_mask, logits_to_keep, return_hidden_states=True
             )
             # else:
                 # old_per_token_logps = None
@@ -240,16 +290,23 @@ class GRPOEntropyTrainer(GRPOTrainer):
         else:
             completions = completions_text
 
-        rewards_per_func = torch.zeros(len(prompts), len(self.reward_funcs), device=device)
+        # Gather completions and logprobs from all processes
+        all_completions = gather_object(completions)
+        all_logprobs = gather(old_per_token_logps) if old_per_token_logps is not None else None
+        all_hidden_states = gather(old_last_token_embeddings) if old_last_token_embeddings is not None else None
+        all_completion_ids = gather(completion_ids)
+
+        # Compute rewards after gathering all data
+        rewards_per_func = torch.zeros(len(all_completions), len(self.reward_funcs), device=device)
         for i, (reward_func, reward_processing_class) in enumerate(
             zip(self.reward_funcs, self.reward_processing_classes)
         ):
             if isinstance(reward_func, nn.Module):  # Module instead of PretrainedModel for compat with compiled models
                 if is_conversational(inputs[0]):
-                    messages = [{"messages": p + c} for p, c in zip(prompts, completions)]
+                    messages = [{"messages": p + c} for p, c in zip(prompts, all_completions)]
                     texts = [apply_chat_template(x, reward_processing_class)["text"] for x in messages]
                 else:
-                    texts = [p + c for p, c in zip(prompts, completions)]
+                    texts = [p + c for p, c in zip(prompts, all_completions)]
                 reward_inputs = reward_processing_class(
                     texts, return_tensors="pt", padding=True, padding_side="right", add_special_tokens=False
                 )
@@ -257,22 +314,22 @@ class GRPOEntropyTrainer(GRPOTrainer):
                 with torch.inference_mode():
                     rewards_per_func[:, i] = reward_func(**reward_inputs).logits[:, 0]  # Shape (B*G,)
             elif "entropy" in reward_func.__name__:
-                # Repeat all input columns (but "prompt" and "completion") to match the number of generations
-                keys = [key for key in inputs[0] if key not in ["prompt", "completion"]]
-                reward_kwargs = {key: [example[key] for example in inputs] for key in keys}
                 # Pass logprobs to the entropy reward function
-                output_reward_func = reward_func(prompts=prompts, completions=completions, logprobs=old_per_token_logps, completion_ids=completion_ids)
+                output_reward_func = reward_func(
+                    prompts=prompts, 
+                    completions=all_completions, 
+                    logprobs=all_logprobs, 
+                    hidden_states=all_hidden_states, 
+                    completion_ids=all_completion_ids,
+                    num_generations=self.num_generations
+                )
                 rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
             else:
                 # Repeat all input columns (but "prompt" and "completion") to match the number of generations
                 keys = [key for key in inputs[0] if key not in ["prompt", "completion"]]
                 reward_kwargs = {key: [example[key] for example in inputs] for key in keys}
-                output_reward_func = reward_func(prompts=prompts, completions=completions, **reward_kwargs)
+                output_reward_func = reward_func(prompts=prompts, completions=all_completions, **reward_kwargs)
                 rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
-
-        # Gather the reward per function: this part is crucial, because the rewards are normalized per group and the
-        # completions may be distributed across processes
-        rewards_per_func = gather(rewards_per_func)
 
         # Apply weights to each reward function's output and sum
         rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).sum(dim=1)
@@ -325,13 +382,13 @@ class GRPOEntropyTrainer(GRPOTrainer):
             rewards_to_log = rewards.tolist()
 
             if self.accelerator.is_main_process:
-                if is_rich_available():
-                    print_prompt_completions_sample(
-                        prompts_to_log,
-                        completions_to_log,
-                        rewards_to_log,
-                        self.state.global_step,
-                    )
+                # if is_rich_available():
+                #     print_prompt_completions_sample(
+                #         prompts_to_log,
+                #         completions_to_log,
+                #         rewards_to_log,
+                #         self.state.global_step,
+                #     )
                 if self.args.report_to and "wandb" in self.args.report_to and wandb.run is not None:
                     import pandas as pd
 
@@ -423,7 +480,13 @@ def main(script_args, training_args, model_args):
         "tag_count": tag_count_reward,
         "code": code_reward,
         "code_format": get_code_format_reward(language=script_args.code_language),
-        "token_entropy": get_token_entropy_reward(reduction=script_args.token_entropy_reduction)
+        "token_entropy": get_token_entropy_reward(reduction=script_args.token_entropy_reduction),
+        "embedding_entropy": get_embedding_entropy_reward(
+            reduction=script_args.embedding_entropy_reduction,
+            similarity=script_args.embedding_entropy_similarity,
+            token=script_args.embedding_entropy_token,
+            hidden_state_reduction=script_args.embedding_entropy_hidden_state_reduction
+        )
     }
     reward_funcs = [reward_mapping[func] for func in script_args.reward_funcs]
 
