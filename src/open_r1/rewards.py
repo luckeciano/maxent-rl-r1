@@ -471,8 +471,8 @@ def get_token_entropy_reward(reduction: str = "sum"):
             warnings.warn("logprobs is None, returning 0.0 rewards for all completions")
             return [0.0] * len(completions)
 
-        # max ent RL for policy gradients is just the sum of the logprobs of the completion tokens
-        # so we just return the sum of the logprobs
+        # max ent RL for policy gradients is just the sum of the logprobs of the completion tokens
+        # so we just return the sum of the logprobs
         if reduction == "sum":
             return torch.sum(-logprobs, dim=1).tolist()
         elif reduction == "mean":
@@ -481,3 +481,96 @@ def get_token_entropy_reward(reduction: str = "sum"):
             raise ValueError(f"Invalid reduction method: {reduction}")
 
     return token_entropy_reward
+
+def get_embedding_similarity_reward(
+        embedding_entropy_reduction: str = "mean", # use pca?
+        embedding_entropy_similarity: str = "cosine", # cosine, euclidean
+        embedding_entropy_token: str = "last", # last, mean, concat
+        embedding_entropy_hidden_state_reduction: list[int] = [-1, -1], # concat layer idxs in this range
+        max_similarity: float = 0.8):
+    """
+    Get a reward function that promotes diverse embeddings across generations by penalizing high cosine similarity.
+    
+    Args:
+        embedding_entropy_reduction: The reduction method to use for the entropy reward.
+        embedding_entropy_similarity: The similarity metric to use for the entropy reward.
+        embedding_entropy_token: The token to use for the entropy reward.
+        embedding_entropy_hidden_state_reduction: The hidden state reduction method to use for the entropy reward.
+        max_similarity: Maximum allowed cosine similarity between embeddings (0.0 to 1.0)
+    """
+    def embedding_similarity_reward(completions, hidden_states=None, num_generations=None, **kwargs) -> list[float]:
+        """Calculate reward based on embedding similarity between generations.
+        
+        Args:
+            completions: List of model completions
+            hidden_states: Hidden states (num_layers, B, L, H)
+            num_generations: Number of generations per prompt
+            **kwargs: Additional arguments
+            
+        Returns:
+            List of rewards where higher values indicate more diverse embeddings
+        """
+        if hidden_states is None:
+            warnings.warn("hidden_states is None, returning 0.0 rewards for all completions")
+            return [0.0] * len(completions)
+            
+        if num_generations is None or num_generations == 1:
+            warnings.warn("num_generations is None or 1, returning 0.0 rewards for all completions")
+            return [0.0] * len(completions)
+        
+        # get the correct layer, concat layers in this range (B, L, H)
+        # TODO this might need to be a list of tensors
+        print(hidden_states.shape)
+        embeddings = torch.concat(hidden_states[embedding_entropy_hidden_state_reduction[0]:embedding_entropy_hidden_state_reduction[1], :, :, :], dim=0)
+        print(embeddings.shape)
+        # get the correct token (B, H)
+        if embedding_entropy_token == "last":
+            # TODO might need to be -2 to exclude the eos token
+            embeddings = embeddings[:, -2, :]
+        elif embedding_entropy_token == "mean":
+            embeddings = embeddings.mean(dim=1)
+        elif embedding_entropy_token == "concat":
+            embeddings = embeddings.view(embeddings.size(0), -1)
+        else:
+            raise ValueError(f"Invalid token: {embedding_entropy_token}")
+        print(embeddings.shape)
+        
+        # Reshape to group by prompt (num_generations per prompt)
+        embeddings = embeddings.view(-1, num_generations, embeddings.size(-1))  # (B/G, G, H)
+        print(embeddings.shape)
+        
+        if embedding_entropy_similarity == "cosine":
+            # Compute cosine similarity between all pairs of embeddings within each group
+            # Normalize embeddings
+            embeddings_norm = embeddings / (embeddings.norm(dim=-1, keepdim=True) + 1e-8)
+            # Compute similarity matrix for each group
+            similarity = torch.matmul(embeddings_norm, embeddings_norm.transpose(-2, -1))  # (B/G, G, G)    
+            # Mask out self-similarity
+            mask = torch.eye(num_generations, device=similarity.device)
+            similarity = similarity * (1 - mask)
+            print(similarity.shape, similarity)
+            # Mask out lower triangle
+            similarity = similarity.triu(diagonal=1)
+            print(similarity.shape, similarity)
+        else:
+            raise ValueError(f"Invalid similarity metric: {embedding_entropy_similarity}")
+    
+        if embedding_entropy_reduction == "max":
+            # max over last two dimensions
+            rewards = similarity.max(dim=-1).max(dim=-1)[0]  # (B/G,)
+            print(rewards.shape, rewards)
+        elif embedding_entropy_reduction == "mean":
+            rewards = similarity.sum(dim=-1).sum(dim=-1)  # (B/G,)
+            rewards = rewards / num_generations
+        elif embedding_entropy_reduction == "sum":
+            rewards = similarity.sum(dim=-1).sum(dim=-1)  # (B/G,)
+        else:
+            raise ValueError(f"Invalid reduction method: {embedding_entropy_reduction}")
+
+        print(rewards.shape, rewards)
+        # repeat rewards for each generation
+        rewards = rewards.repeat_interleave(num_generations)
+        print(rewards.shape, rewards)
+        return rewards.tolist()
+
+    return embedding_similarity_reward
