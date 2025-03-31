@@ -376,7 +376,6 @@ class GRPOEntropyTrainer(GRPOTrainer):
             prompts_to_log = gather_object(prompts_text)
             completions_to_log = gather_object(completions_text)
             rewards_to_log = rewards.tolist()
-            print(prompts_to_log, completions_to_log, rewards_to_log)
 
             if self.accelerator.is_main_process:
                 # if is_rich_available():

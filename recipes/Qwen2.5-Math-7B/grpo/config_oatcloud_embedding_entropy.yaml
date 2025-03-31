@@ -47,8 +47,8 @@ reward_funcs:
 - format
 - embedding_entropy
 token_entropy_reduction: mean
-embedding_entropy_reduction: mean # use pca?
-embedding_entropy_similarity: cosine # cosine, euclidean
+embedding_entropy_reduction: mean # use pca? (mean, max, sum)
+embedding_entropy_similarity: cosine # cosine, euclidean (pairwise similarity)
 embedding_entropy_token: last # last, mean, concat
 # embedding_entropy_hidden_state_reduction: (-1, 100) # concat layer idxs in this range
 reward_weights:
