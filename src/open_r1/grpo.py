@@ -324,9 +324,12 @@ class GRPOEntropyTrainer(GRPOTrainer):
                 output_reward_func = reward_func(prompts=prompts, completions=completions, **reward_kwargs)
                 rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
 
+        # Gather the reward per function: this part is crucial, because the rewards are normalized per group and the
+        # completions may be distributed across processes
+        rewards_per_func = gather(rewards_per_func)
+
         # Apply weights to each reward function's output and sum
         rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).sum(dim=1)
-
         # Compute grouped-wise rewards
         mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)
         std_grouped_rewards = rewards.view(-1, self.num_generations).std(dim=1)
@@ -373,15 +376,16 @@ class GRPOEntropyTrainer(GRPOTrainer):
             prompts_to_log = gather_object(prompts_text)
             completions_to_log = gather_object(completions_text)
             rewards_to_log = rewards.tolist()
+            print(prompts_to_log, completions_to_log, rewards_to_log)
 
             if self.accelerator.is_main_process:
-                if is_rich_available():
-                    print_prompt_completions_sample(
-                        prompts_to_log,
-                        completions_to_log,
-                        rewards_to_log,
-                        self.state.global_step,
-                    )
+                # if is_rich_available():
+                    # print_prompt_completions_sample(
+                    #     prompts_to_log,
+                    #     completions_to_log,
+                    #     rewards_to_log,
+                    #     self.state.global_step,
+                    # )
                 if self.args.report_to and "wandb" in self.args.report_to and wandb.run is not None:
                     import pandas as pd
 
