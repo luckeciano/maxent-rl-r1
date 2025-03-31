@@ -482,12 +482,12 @@ def get_token_entropy_reward(reduction: str = "sum"):
 
     return token_entropy_reward
 
-def get_embedding_similarity_reward(
+def get_embedding_entropy_reward(
         embedding_entropy_reduction: str = "mean", # use pca?
         embedding_entropy_similarity: str = "cosine", # cosine, euclidean
         embedding_entropy_token: str = "last", # last, mean, concat
-        embedding_entropy_hidden_state_reduction: list[int] = [-1, -1], # concat layer idxs in this range
-        max_similarity: float = 0.8):
+        embedding_entropy_hidden_state_reduction: tuple[int] = (-1, 100), # concat layer idxs in this range
+    ):
     """
     Get a reward function that promotes diverse embeddings across generations by penalizing high cosine similarity.
     
@@ -498,7 +498,7 @@ def get_embedding_similarity_reward(
         embedding_entropy_hidden_state_reduction: The hidden state reduction method to use for the entropy reward.
         max_similarity: Maximum allowed cosine similarity between embeddings (0.0 to 1.0)
     """
-    def embedding_similarity_reward(completions, hidden_states=None, num_generations=None, **kwargs) -> list[float]:
+    def embedding_entropy_reward(completions, hidden_states=None, num_generations=None, **kwargs) -> list[float]:
         """Calculate reward based on embedding similarity between generations.
         
         Args:
@@ -519,9 +519,9 @@ def get_embedding_similarity_reward(
             return [0.0] * len(completions)
         
         # get the correct layer, concat layers in this range (B, L, H)
-        # TODO this might need to be a list of tensors
         print(hidden_states.shape)
-        embeddings = torch.concat(hidden_states[embedding_entropy_hidden_state_reduction[0]:embedding_entropy_hidden_state_reduction[1], :, :, :], dim=0)
+        embeddings = hidden_states.permute(1,2,0,3)[:,:,embedding_entropy_hidden_state_reduction[0]:embedding_entropy_hidden_state_reduction[1],:]
+        embeddings = embeddings.reshape(embeddings.size(0), -1, embeddings.size(-1))    # (B, L, H*num_layers)
         print(embeddings.shape)
         # get the correct token (B, H)
         if embedding_entropy_token == "last":
@@ -561,7 +561,7 @@ def get_embedding_similarity_reward(
             print(rewards.shape, rewards)
         elif embedding_entropy_reduction == "mean":
             rewards = similarity.sum(dim=-1).sum(dim=-1)  # (B/G,)
-            rewards = rewards / num_generations
+            rewards = rewards / num_generations # TODO maybe should divide by number of pairs instead? Just a multiplier though
         elif embedding_entropy_reduction == "sum":
             rewards = similarity.sum(dim=-1).sum(dim=-1)  # (B/G,)
         else:
@@ -573,4 +573,4 @@ def get_embedding_similarity_reward(
         print(rewards.shape, rewards)
         return rewards.tolist()
 
-    return embedding_similarity_reward
+    return embedding_entropy_reward
