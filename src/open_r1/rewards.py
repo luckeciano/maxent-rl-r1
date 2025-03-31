@@ -519,10 +519,8 @@ def get_embedding_entropy_reward(
             return [0.0] * len(completions)
         
         # get the correct layer, concat layers in this range (B, L, H)
-        print(hidden_states.shape)
         embeddings = hidden_states.permute(1,2,0,3)[:,:,embedding_entropy_hidden_state_reduction[0]:embedding_entropy_hidden_state_reduction[1],:]
         embeddings = embeddings.reshape(embeddings.size(0), -1, embeddings.size(-1))    # (B, L, H*num_layers)
-        print(embeddings.shape)
         # get the correct token (B, H)
         if embedding_entropy_token == "last":
             # TODO might need to be -2 to exclude the eos token
@@ -533,11 +531,9 @@ def get_embedding_entropy_reward(
             embeddings = embeddings.view(embeddings.size(0), -1)
         else:
             raise ValueError(f"Invalid token: {embedding_entropy_token}")
-        print(embeddings.shape)
         
         # Reshape to group by prompt (num_generations per prompt)
         embeddings = embeddings.view(-1, num_generations, embeddings.size(-1))  # (B/G, G, H)
-        print(embeddings.shape)
         
         if embedding_entropy_similarity == "cosine":
             # Compute cosine similarity between all pairs of embeddings within each group
@@ -548,17 +544,14 @@ def get_embedding_entropy_reward(
             # Mask out self-similarity
             mask = torch.eye(num_generations, device=similarity.device)
             similarity = similarity * (1 - mask)
-            print(similarity.shape, similarity)
             # Mask out lower triangle
             similarity = similarity.triu(diagonal=1)
-            print(similarity.shape, similarity)
         else:
             raise ValueError(f"Invalid similarity metric: {embedding_entropy_similarity}")
     
         if embedding_entropy_reduction == "max":
             # max over last two dimensions
             rewards = similarity.max(dim=-1).max(dim=-1)[0]  # (B/G,)
-            print(rewards.shape, rewards)
         elif embedding_entropy_reduction == "mean":
             rewards = similarity.sum(dim=-1).sum(dim=-1)  # (B/G,)
             rewards = rewards / num_generations # TODO maybe should divide by number of pairs instead? Just a multiplier though
@@ -567,10 +560,8 @@ def get_embedding_entropy_reward(
         else:
             raise ValueError(f"Invalid reduction method: {embedding_entropy_reduction}")
 
-        print(rewards.shape, rewards)
         # repeat rewards for each generation
         rewards = rewards.repeat_interleave(num_generations)
-        print(rewards.shape, rewards)
         return rewards.tolist()
 
     return embedding_entropy_reward
