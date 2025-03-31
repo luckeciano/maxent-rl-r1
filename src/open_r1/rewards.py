@@ -534,29 +534,32 @@ def get_embedding_entropy_reward(
         
         # Reshape to group by prompt (num_generations per prompt)
         embeddings = embeddings.view(-1, num_generations, embeddings.size(-1))  # (B/G, G, H)
+        # Normalize embeddings
+        embeddings_norm = embeddings / (embeddings.norm(dim=-1, keepdim=True) + 1e-8)     
         
         if embedding_entropy_similarity == "cosine":
             # Compute cosine similarity between all pairs of embeddings within each group
-            # Normalize embeddings
-            embeddings_norm = embeddings / (embeddings.norm(dim=-1, keepdim=True) + 1e-8)
             # Compute similarity matrix for each group
-            similarity = torch.matmul(embeddings_norm, embeddings_norm.transpose(-2, -1))  # (B/G, G, G)    
-            # Mask out self-similarity
-            mask = torch.eye(num_generations, device=similarity.device)
-            similarity = similarity * (1 - mask)
-            # Mask out lower triangle
+            similarity = torch.matmul(embeddings_norm, embeddings_norm.transpose(-2, -1))  # (B/G, G, G)       
+            # Mask out self-similarity and lower triangle
+            similarity = similarity.triu(diagonal=1)
+        elif embedding_entropy_similarity == "euclidean":
+            # Compute pairwise Euclidean distances between embeddings
+            similarity = torch.cdist(embeddings_norm, embeddings_norm)  # (B/G, G, G)
+            # Mask out self-distances and lower triangle
             similarity = similarity.triu(diagonal=1)
         else:
             raise ValueError(f"Invalid similarity metric: {embedding_entropy_similarity}")
-    
+        # we want to maximize diversity, so we reward negative similarity
+        rewards = -similarity  
         if embedding_entropy_reduction == "max":
             # max over last two dimensions
-            rewards = similarity.max(dim=-1).max(dim=-1)[0]  # (B/G,)
+            rewards = rewards.max(dim=-1).max(dim=-1)[0]  # (B/G,)
         elif embedding_entropy_reduction == "mean":
-            rewards = similarity.sum(dim=-1).sum(dim=-1)  # (B/G,)
+            rewards = rewards.sum(dim=-1).sum(dim=-1)  # (B/G,)
             rewards = rewards / num_generations # TODO maybe should divide by number of pairs instead? Just a multiplier though
         elif embedding_entropy_reduction == "sum":
-            rewards = similarity.sum(dim=-1).sum(dim=-1)  # (B/G,)
+            rewards = rewards.sum(dim=-1).sum(dim=-1)  # (B/G,)
         else:
             raise ValueError(f"Invalid reduction method: {embedding_entropy_reduction}")
 
