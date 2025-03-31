@@ -139,7 +139,7 @@ class GRPOScriptArguments(ScriptArguments):
         metadata={"help": "Token to use for embedding entropy reward. Possible values: 'last', 'mean', 'concat'"},
     )
     embedding_entropy_hidden_state_reduction: str = field(
-        default=[-1, -1],
+        default=(-1, 100),
         metadata={"help": "Hidden states used for embedding entropy reward. Format: [start_layer, end_layer]"},
     )
 
@@ -173,9 +173,8 @@ class GRPOEntropyTrainer(GRPOTrainer):
         logits = logits[:, -logits_to_keep:]
         log_probs = selective_log_softmax(logits, input_ids)  # compute logprobs for the input tokens
         if return_hidden_states:
-            print(len(outputs.hidden_states), len(outputs.hidden_states[-1]), outputs.hidden_states[-1][0].shape)
-            # hidden states are (num_generated_tokens, num_layers, batch, sequence, hidden)
-            embeddings = torch.stack([x for x in outputs.hidden_states[-1]])  # (num_layers, B, L, H)
+            # hidden states are (num_layers, batch, sequence, hidden)
+            embeddings = torch.stack([x for x in outputs.hidden_states])  # (num_layers, B, L, H)
             return log_probs, embeddings
         else:
             return log_probs
@@ -290,23 +289,16 @@ class GRPOEntropyTrainer(GRPOTrainer):
         else:
             completions = completions_text
 
-        # Gather completions and logprobs from all processes
-        all_completions = gather_object(completions)
-        all_logprobs = gather(old_per_token_logps) if old_per_token_logps is not None else None
-        all_hidden_states = gather(old_last_token_embeddings) if old_last_token_embeddings is not None else None
-        all_completion_ids = gather(completion_ids)
-
-        # Compute rewards after gathering all data
-        rewards_per_func = torch.zeros(len(all_completions), len(self.reward_funcs), device=device)
+        rewards_per_func = torch.zeros(len(prompts), len(self.reward_funcs), device=device)
         for i, (reward_func, reward_processing_class) in enumerate(
             zip(self.reward_funcs, self.reward_processing_classes)
         ):
             if isinstance(reward_func, nn.Module):  # Module instead of PretrainedModel for compat with compiled models
                 if is_conversational(inputs[0]):
-                    messages = [{"messages": p + c} for p, c in zip(prompts, all_completions)]
+                    messages = [{"messages": p + c} for p, c in zip(prompts, completions)]
                     texts = [apply_chat_template(x, reward_processing_class)["text"] for x in messages]
                 else:
-                    texts = [p + c for p, c in zip(prompts, all_completions)]
+                    texts = [p + c for p, c in zip(prompts, completions)]
                 reward_inputs = reward_processing_class(
                     texts, return_tensors="pt", padding=True, padding_side="right", add_special_tokens=False
                 )
@@ -315,12 +307,13 @@ class GRPOEntropyTrainer(GRPOTrainer):
                     rewards_per_func[:, i] = reward_func(**reward_inputs).logits[:, 0]  # Shape (B*G,)
             elif "entropy" in reward_func.__name__:
                 # Pass logprobs to the entropy reward function
+                # TODO hidden states might be too large to pass to the reward function after gathering
                 output_reward_func = reward_func(
                     prompts=prompts, 
-                    completions=all_completions, 
-                    logprobs=all_logprobs, 
-                    hidden_states=all_hidden_states, 
-                    completion_ids=all_completion_ids,
+                    completions=completions, 
+                    logprobs=old_per_token_logps, 
+                    hidden_states=old_last_token_embeddings, 
+                    completion_ids=completion_ids,
                     num_generations=self.num_generations
                 )
                 rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
@@ -328,7 +321,7 @@ class GRPOEntropyTrainer(GRPOTrainer):
                 # Repeat all input columns (but "prompt" and "completion") to match the number of generations
                 keys = [key for key in inputs[0] if key not in ["prompt", "completion"]]
                 reward_kwargs = {key: [example[key] for example in inputs] for key in keys}
-                output_reward_func = reward_func(prompts=prompts, completions=all_completions, **reward_kwargs)
+                output_reward_func = reward_func(prompts=prompts, completions=completions, **reward_kwargs)
                 rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
 
         # Apply weights to each reward function's output and sum
@@ -382,13 +375,13 @@ class GRPOEntropyTrainer(GRPOTrainer):
             rewards_to_log = rewards.tolist()
 
             if self.accelerator.is_main_process:
-                # if is_rich_available():
-                #     print_prompt_completions_sample(
-                #         prompts_to_log,
-                #         completions_to_log,
-                #         rewards_to_log,
-                #         self.state.global_step,
-                #     )
+                if is_rich_available():
+                    print_prompt_completions_sample(
+                        prompts_to_log,
+                        completions_to_log,
+                        rewards_to_log,
+                        self.state.global_step,
+                    )
                 if self.args.report_to and "wandb" in self.args.report_to and wandb.run is not None:
                     import pandas as pd
 
@@ -482,10 +475,10 @@ def main(script_args, training_args, model_args):
         "code_format": get_code_format_reward(language=script_args.code_language),
         "token_entropy": get_token_entropy_reward(reduction=script_args.token_entropy_reduction),
         "embedding_entropy": get_embedding_entropy_reward(
-            reduction=script_args.embedding_entropy_reduction,
-            similarity=script_args.embedding_entropy_similarity,
-            token=script_args.embedding_entropy_token,
-            hidden_state_reduction=script_args.embedding_entropy_hidden_state_reduction
+            embedding_entropy_reduction=script_args.embedding_entropy_reduction,
+            embedding_entropy_similarity=script_args.embedding_entropy_similarity,
+            embedding_entropy_token=script_args.embedding_entropy_token,
+            embedding_entropy_hidden_state_reduction=script_args.embedding_entropy_hidden_state_reduction,
         )
     }
     reward_funcs = [reward_mapping[func] for func in script_args.reward_funcs]
