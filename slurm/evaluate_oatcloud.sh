@@ -27,6 +27,7 @@ export PYTHONWARNINGS="ignore::DeprecationWarning"
 source /scratch-ssd/oatml/miniconda3/bin/activate maxent-r1
 
 cd ~/maxent-rl-r1
+echo "pwd: $(pwd)"
 pip install --no-cache-dir --upgrade pip
 pip install --no-cache-dir -e ".[dev]"
 
