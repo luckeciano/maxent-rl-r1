@@ -6,7 +6,7 @@
 #SBATCH --exclusive
 #SBATCH --job-name="act-pm"
 #SBATCH --output=/users/shrlik/Projects/llm/maxent-rl-r1/logs/slurm-%j.out
-#SBATCH --error=/users/shrlik/Projects/llm/maxent-rl-r1logs/slurm-%j.err
+#SBATCH --error=/users/shrlik/Projects/llm/maxent-rl-r1/logs/slurm-%j.err
 
 source ./.env
 export CONDA_ENVS_PATH=/scratch-ssd/$USER/conda_envs
