@@ -544,9 +544,10 @@ def get_embedding_entropy_reward(
             similarity = similarity.triu(diagonal=1)
         elif embedding_entropy_similarity == "euclidean":
             # Compute pairwise Euclidean distances between embeddings
-            similarity = torch.cdist(embeddings_norm, embeddings_norm)  # (B/G, G, G)
+            distance = torch.cdist(embeddings_norm, embeddings_norm)  # (B/G, G, G)
             # Mask out self-distances and lower triangle
-            similarity = similarity.triu(diagonal=1)
+            distance = distance.triu(diagonal=1)
+            similarity = -distance
         else:
             raise ValueError(f"Invalid similarity metric: {embedding_entropy_similarity}")
             
