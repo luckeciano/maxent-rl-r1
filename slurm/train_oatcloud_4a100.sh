@@ -40,10 +40,10 @@ huggingface-cli login --token $HUGGINGFACE_WRITETOKEN
 
 echo "START TIME: $(date)"
 
-MODEL=$1 #e.g., Qwen2.5-Math-7B
-TASK=$2 #e.g., grpo
-CONFIG_SUFFIX=$3 #e.g., oatcloud
-ACCELERATOR=$4 #e.g., zero2_oatcloud
+MODEL=${1:-"Qwen2.5-Math-7B"}
+TASK=${2:-"grpo"}
+CONFIG_SUFFIX=${3:-"oatcloud"}
+ACCELERATOR=${4:-"zero2_oatcloud"}
 OPTIONAL_ARGS=""
 
 # Training setup
