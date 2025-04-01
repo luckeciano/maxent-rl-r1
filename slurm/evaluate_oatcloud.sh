@@ -27,6 +27,7 @@ export PYTHONWARNINGS="ignore::DeprecationWarning"
 source /scratch-ssd/oatml/miniconda3/bin/activate maxent-r1
 
 cd ~/maxent-rl-r1
+echo "pwd: $(pwd)"
 pip install --no-cache-dir --upgrade pip
 pip install --no-cache-dir -e ".[dev]"
 
@@ -60,9 +61,9 @@ else
     MODEL_ARGS="pretrained=$MODEL_ID,revision=$MODEL_REVISION,trust_remote_code=$TRUST_REMOTE_CODE,dtype=bfloat16,data_parallel_size=$NUM_GPUS,max_model_length=$MAX_MODEL_LENGTH,gpu_memory_utilization=0.8,generation_parameters={max_new_tokens:$MAX_MODEL_LENGTH,temperature:0.6,top_p:0.95}"
 fi
 
-LM_EVAL_REPO_ID="s-a-malik/maxent-rl-eval-leaderboard"
+LM_EVAL_REPO_ID="LLMsMaxEntRL/maxent-rl-eval-leaderboard"
 MODEL_NAME=$(echo $MODEL_ID | sed 's/\//_/g') # replaces / with _
-DETAILS_REPO_ID="s-a-malik/maxent-rl-details-$MODEL_NAME"
+DETAILS_REPO_ID="LLMsMaxEntRL/maxent-rl-details-$MODEL_NAME"
 OUTPUT_DIR="eval_results/$MODEL_ID/$MODEL_REVISION/$TASK_NAME"
 # We need this flag since we run this script from training jobs that use DeepSpeed and the env vars get progated which causes errors during evaluation
 ACCELERATE_USE_DEEPSPEED=false

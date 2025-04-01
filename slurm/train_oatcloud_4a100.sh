@@ -30,6 +30,7 @@ source /scratch-ssd/oatml/miniconda3/bin/activate maxent-r1
 pip install flash-attn --no-build-isolation
 
 cd ~/maxent-rl-r1
+echo "pwd: $(pwd)"
 pip install --no-cache-dir --upgrade pip
 pip install --no-cache-dir -e ".[dev]"
 
