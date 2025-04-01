@@ -544,7 +544,11 @@ def get_embedding_entropy_reward(
             similarity = similarity.triu(diagonal=1)
         elif embedding_entropy_similarity == "euclidean":
             # Compute pairwise Euclidean distances between embeddings
-            distance = torch.cdist(embeddings_norm, embeddings_norm)  # (B/G, G, G)
+            # (a-b)^2 = a^2 + b^2 - 2ab
+            # For normalized vectors, a^2 = b^2 = 1, so (a-b)^2 = 2 - 2ab
+            # Therefore, distance = sqrt(2 - 2ab)
+            dot_product = torch.matmul(embeddings_norm, embeddings_norm.transpose(-2, -1))  # (B/G, G, G)
+            distance = torch.sqrt(2 - 2 * dot_product)  # (B/G, G, G)
             # Mask out self-distances and lower triangle
             distance = distance.triu(diagonal=1)
             similarity = -distance
