@@ -541,7 +541,7 @@ def get_embedding_entropy_reward(
             similarity = torch.matmul(embeddings_norm, embeddings_norm.transpose(-2, -1))  # (B/G, G, G)       
             # Mask out self-similarity
             mask = torch.eye(similarity.size(-1), dtype=torch.bool, device=similarity.device)
-            similarity = similarity * (1 - mask)
+            similarity = similarity * (~mask)
         else:
             raise ValueError(f"Invalid similarity metric: {embedding_entropy_similarity}")
             
