@@ -536,32 +536,31 @@ def get_embedding_entropy_reward(
         embeddings = embeddings.view(-1, num_generations, embeddings.size(-1))  # (B/G, G, H)
         # Normalize embeddings
         embeddings_norm = embeddings / (embeddings.norm(dim=-1, keepdim=True) + 1e-8)     
-        
         if embedding_entropy_similarity == "cosine":
             # Compute cosine similarity between all pairs of embeddings within each group
             similarity = torch.matmul(embeddings_norm, embeddings_norm.transpose(-2, -1))  # (B/G, G, G)       
-            # Mask out self-similarity and lower triangle
-            similarity = similarity.triu(diagonal=1)
+            # Mask out self-similarity
+            similarity = similarity.fill_diagonal_(0)
         else:
             raise ValueError(f"Invalid similarity metric: {embedding_entropy_similarity}")
             
         # we want to maximize diversity, so we reward negative similarity
-        rewards = -similarity  
+        rewards = -similarity  # (B/G, G, G)
         
         if embedding_entropy_reduction == "max":
-            # max over last two dimensions
-            rewards = rewards.max(dim=-1).max(dim=-1)[0]  # (B/G,)
+            # For each generation, get max similarity to other generations
+            rewards = rewards.max(dim=-1)[0]  # (B/G, G)
         elif embedding_entropy_reduction == "mean":
-            # Compute mean over all pairs
-            num_pairs = (num_generations * (num_generations - 1)) / 2
-            rewards = rewards.sum(dim=-1).sum(dim=-1) / num_pairs  # (B/G,)
+            # For each generation, get mean similarity to other generations
+            rewards = rewards.sum(dim=-1) / (num_generations - 1)  # (B/G, G) 
         elif embedding_entropy_reduction == "sum":
-            rewards = rewards.sum(dim=-1).sum(dim=-1)  # (B/G,)
+            # For each generation, get sum of similarities to other generations
+            rewards = rewards.sum(dim=-1)  # (B/G, G)
         else:
             raise ValueError(f"Invalid reduction method: {embedding_entropy_reduction}")
 
-        # repeat rewards for each generation
-        rewards = rewards.repeat_interleave(num_generations)
+        # Flatten rewards across batches and generations
+        rewards = rewards.reshape(-1)
         return rewards.tolist()
 
     return embedding_entropy_reward
