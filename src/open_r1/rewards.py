@@ -540,7 +540,8 @@ def get_embedding_entropy_reward(
             # Compute cosine similarity between all pairs of embeddings within each group
             similarity = torch.matmul(embeddings_norm, embeddings_norm.transpose(-2, -1))  # (B/G, G, G)       
             # Mask out self-similarity
-            similarity = similarity.fill_diagonal_(0)
+            mask = torch.eye(similarity, dtype=torch.bool, device=similarity.device)
+            similarity = similarity * (1 - mask)
         else:
             raise ValueError(f"Invalid similarity metric: {embedding_entropy_similarity}")
             
