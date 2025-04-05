@@ -7,6 +7,7 @@ import re
 from typing import Dict
 import warnings
 import torch
+from collections import Counter
 
 from latex2sympy2_extended import NormalizationConfig
 from math_verify import LatexExtractionConfig, parse, verify
@@ -23,50 +24,123 @@ else:
     AsyncSandbox = None
 
 
-def accuracy_reward(completions, solution, **kwargs):
-    """Reward function that checks if the completion is the same as the ground truth."""
+def parse_answer(content: str, solution: str) -> tuple[bool, list]:
+    """Parse answer and solution, returning whether parsing succeeded and the parsed answers.
+    
+    Args:
+        content: Model completion to parse
+        solution: Ground truth solution to parse
+        
+    Returns:
+        tuple containing:
+        - bool: Whether parsing succeeded
+        - list: List containing [parsed_answer, parsed_solution] if successful
+    """
+    gold_parsed = parse(
+        solution,
+        extraction_mode="first_match",
+        extraction_config=[LatexExtractionConfig()],
+    )
+    
+    if len(gold_parsed) == 0:
+        return False, []
+        
+    answer_parsed = parse(
+        content,
+        extraction_config=[
+            LatexExtractionConfig(
+                normalization_config=NormalizationConfig(
+                    nits=False,
+                    malformed_operators=False,
+                    basic_latex=True,
+                    equations=True,
+                    boxed="all",
+                    units=True,
+                ),
+                # Ensures that boxed is tried first
+                boxed_match_priority=0,
+                try_extract_without_anchor=False,
+            )
+        ],
+        extraction_mode="first_match",
+    )
+    
+    return True, [answer_parsed, gold_parsed]
+
+def compute_accuracy_and_parsed_answers(completions, solution) -> tuple[list[float], list]:
+    """Helper function that computes accuracy rewards and collects parsed answers.
+    
+    Args:
+        completions: List of model completions
+        solution: List of ground truth solutions
+        
+    Returns:
+        tuple containing:
+        - list[float]: Accuracy rewards
+        - list: List of parsed answers (empty strings for failed parses)
+    """
     contents = [completion[0]["content"] for completion in completions]
     rewards = []
+    parsed_answers = []
+    
     for content, sol in zip(contents, solution):
-        gold_parsed = parse(
-            sol,
-            extraction_mode="first_match",
-            extraction_config=[LatexExtractionConfig()],
-        )
-        if len(gold_parsed) != 0:
-            # We require the answer to be provided in correct latex (no malformed operators)
-            answer_parsed = parse(
-                content,
-                extraction_config=[
-                    LatexExtractionConfig(
-                        normalization_config=NormalizationConfig(
-                            nits=False,
-                            malformed_operators=False,
-                            basic_latex=True,
-                            equations=True,
-                            boxed="all",
-                            units=True,
-                        ),
-                        # Ensures that boxed is tried first
-                        boxed_match_priority=0,
-                        try_extract_without_anchor=False,
-                    )
-                ],
-                extraction_mode="first_match",
-            )
-            # Reward 1 if the content is the same as the ground truth, 0 otherwise
-            try:
-                reward = float(verify(answer_parsed, gold_parsed))
-            except Exception as e:
-                print(f"verify failed: {e}, answer: {answer_parsed}, gold: {gold_parsed}")
-                reward = 0.0
-        else:
-            # If the gold solution is not parseable, we reward 1 to skip this example
-            reward = 1.0
+        success, parsed = parse_answer(content, sol)
+        
+        if not success:
+            reward = 1.0  # Skip unparseable examples
             print("Failed to parse gold solution: ", sol)
+            parsed_answers.append("")  # Add empty string for unparseable answers
+        else:
+            try:
+                reward = float(verify(parsed[0], parsed[1]))
+                # Only try to access index if parsed[0] is not empty
+                parsed_answers.append(parsed[0][1] if len(parsed[0]) > 1 else "")
+            except Exception as e:
+                print(f"verify failed: {e}, answer: {parsed[0]}, gold: {parsed[1]}")
+                reward = 0.0
+                parsed_answers.append("")  # Add empty string for verification failures
+                
         rewards.append(reward)
+        
+    return rewards, parsed_answers
 
+def accuracy_reward(completions, solution, **kwargs):
+    """Reward function that checks if the completion is the same as the ground truth."""
+    rewards, _ = compute_accuracy_and_parsed_answers(completions, solution)
     return rewards
+
+def answer_logprob_reward(completions, solution, **kwargs):
+    """Reward function that encourages diversity in answers by penalizing frequent answers.
+    
+    Args:
+        completions: List of model completions
+        solution: List of ground truth solutions
+        
+    Returns:
+        List of entropy-based rewards where lower frequency answers get higher rewards
+    """
+    _, parsed_answers = compute_accuracy_and_parsed_answers(completions, solution)
+    
+    if not parsed_answers:
+        return [0.0] * len(completions)
+        
+    # Calculate negative log probabilities to reward rare answers
+    return [-lp for lp in get_answer_logprobs(parsed_answers)]
+
+def get_answer_logprobs(parsed_answers: list) -> list[float]:
+    """Calculate logprobs based on distribution of parsed answers.
+    
+    Args:
+        parsed_answers: List of parsed answers
+        
+    Returns:
+        list[float]: List of log probabilities for each answer
+    """
+    counter = Counter(parsed_answers)
+    total = len(parsed_answers)
+    
+    # Convert counts to log probabilities
+    return [math.log(counter[answer] / total + 1e-10) for answer in parsed_answers]
 
 
 def format_reward(completions, **kwargs):

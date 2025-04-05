@@ -41,6 +41,7 @@ from open_r1.rewards import (
     reasoning_steps_reward,
     tag_count_reward,
     get_embedding_entropy_reward,
+    answer_logprob_reward,
 )
 from open_r1.utils import get_tokenizer
 from open_r1.utils.callbacks import get_callbacks
@@ -482,7 +483,8 @@ def main(script_args, training_args, model_args):
             embedding_entropy_similarity=script_args.embedding_entropy_similarity,
             embedding_entropy_token=script_args.embedding_entropy_token,
             embedding_entropy_hidden_state_reduction=script_args.embedding_entropy_hidden_state_reduction,
-        )
+        ),
+        "answer_logprob": answer_logprob_reward,
     }
     reward_funcs = [reward_mapping[func] for func in script_args.reward_funcs]
 
