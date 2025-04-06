@@ -11,8 +11,13 @@ dependencies:
   - pytorch=2.5.1
   - pytorch-cuda=12.4
   - cuda-toolkit=12.4
-  - ninja
+  - ninja=1.11.1.3
   - pip:
       - uv
       - vllm==0.7.2
       - setuptools==75.8.0
+      - bitsandbytes==0.45.3
+      - datasets==3.4.1
+      - fastapi==0.115.11
+      - huggingface-hub==0.29.3
+      - wandb==0.19.8
