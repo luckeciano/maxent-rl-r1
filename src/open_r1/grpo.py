@@ -42,6 +42,7 @@ from open_r1.rewards import (
     tag_count_reward,
     get_embedding_entropy_reward,
     answer_logprob_reward,
+    missing_response_penalty,
 )
 from open_r1.utils import get_tokenizer
 from open_r1.utils.callbacks import get_callbacks
@@ -485,6 +486,7 @@ def main(script_args, training_args, model_args):
             embedding_entropy_hidden_state_reduction=script_args.embedding_entropy_hidden_state_reduction,
         ),
         "answer_logprob": answer_logprob_reward,
+        "missing_response": missing_response_penalty,
     }
     reward_funcs = [reward_mapping[func] for func in script_args.reward_funcs]
 

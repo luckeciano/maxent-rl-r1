@@ -109,6 +109,11 @@ def accuracy_reward(completions, solution, **kwargs):
     rewards, _ = compute_accuracy_and_parsed_answers(completions, solution)
     return rewards
 
+def missing_response_penalty(completions, solution, **kwargs):
+    """Reward function that penalizes missing responses."""
+    _, parsed_answers = compute_accuracy_and_parsed_answers(completions, solution)
+    return [-1.0 if answer == "" else 0.0 for answer in parsed_answers]
+
 def answer_logprob_reward(completions, solution, **kwargs):
     """Reward function that encourages diversity in answers by penalizing frequent answers.
     
