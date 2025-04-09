@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections import defaultdict
 import logging
 import os
 import sys
@@ -149,6 +150,8 @@ class GRPOScriptArguments(ScriptArguments):
 class GRPOEntropyTrainer(GRPOTrainer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self._metrics["train_stats"] = defaultdict(list)
+        self._metrics["eval_stats"] = defaultdict(list)
 
     def _get_per_token_logps(self, model, input_ids, attention_mask, logits_to_keep, return_hidden_states=False):
         """Get per-token log probabilities and embeddings from the model.
@@ -325,6 +328,13 @@ class GRPOEntropyTrainer(GRPOTrainer):
                 reward_kwargs = {key: [example[key] for example in inputs] for key in keys}
                 output_reward_func = reward_func(prompts=prompts, completions=completions, **reward_kwargs)
                 rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
+                # Check which responses are correct based on accuracy reward
+                if reward_func.__name__ == "accuracy_reward":
+                    correct_responses = torch.tensor(output_reward_func, dtype=torch.bool, device=device)
+
+                
+        # Log the metrics - mode
+        mode = "eval" if self.control.should_evaluate else "train"
 
         # Gather the reward per function: this part is crucial, because the rewards are normalized per group and the
         # completions may be distributed across processes
@@ -339,7 +349,14 @@ class GRPOEntropyTrainer(GRPOTrainer):
         # Normalize the rewards to compute the advantages
         mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
         std_grouped_rewards = std_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
-        advantages = (rewards - mean_grouped_rewards) / (std_grouped_rewards + 1e-4)
+        advantages = (rewards - mean_grouped_rewards) / (std_grouped_rewards + 1e-4)    
+
+        # Log advantages
+        self._compute_and_log_stats(
+            data=advantages,
+            metric_name='advantages',
+            mode=mode,
+        )
 
         # Slice to keep only the local part of the data
         process_slice = slice(
@@ -347,12 +364,32 @@ class GRPOEntropyTrainer(GRPOTrainer):
             (self.accelerator.process_index + 1) * len(prompts),
         )
         advantages = advantages[process_slice]
+                
 
-        # Log the metrics
-        mode = "eval" if self.control.should_evaluate else "train"
+        completion_length = self.accelerator.gather(completion_mask.sum(1)).float()
+        correct_responses = self.accelerator.gather(correct_responses)
 
-        completion_length = self.accelerator.gather_for_metrics(completion_mask.sum(1)).float().mean().item()
-        self._metrics[mode]["completion_length"].append(completion_length)
+        # Log stats for each reward function
+        for i, reward_func in enumerate(self.reward_funcs):
+            self._compute_and_log_stats(
+                data=rewards_per_func[:, i],
+                metric_name=reward_func.__name__,
+                mode=mode,
+                groups={'correct': correct_responses, 'incorrect': ~correct_responses},
+            )
+
+        self._compute_and_log_stats(
+            data=completion_length,
+            metric_name='completion_length',
+            mode=mode,
+            groups={'correct': correct_responses, 'incorrect': ~correct_responses},
+        )
+
+        self._compute_and_log_stats(
+            data=std_grouped_rewards,
+            metric_name='grouped_std_rewards',
+            mode=mode,
+        )
 
         reward_per_func = rewards_per_func.mean(0)
         for i, reward_func in enumerate(self.reward_funcs):
@@ -396,8 +433,19 @@ class GRPOEntropyTrainer(GRPOTrainer):
                         "prompt": prompts_to_log,
                         "completion": completions_to_log,
                         "reward": rewards.tolist(),
+                        "correct": correct_responses.tolist(),
                     }
+
+                    # Add individual reward function values
+                    for i, reward_func in enumerate(self.reward_funcs):
+                        if isinstance(reward_func, nn.Module):
+                            reward_func_name = reward_func.config._name_or_path.split("/")[-1]
+                        else:
+                            reward_func_name = reward_func.__name__
+                        table[f"reward_{reward_func_name}"] = rewards_per_func[:, i].tolist()
+                        
                     df = pd.DataFrame(table)
+
                     wandb.log({"completions": wandb.Table(dataframe=df)})
 
         return {
@@ -410,6 +458,41 @@ class GRPOEntropyTrainer(GRPOTrainer):
             "advantages": advantages,
         }
 
+    def _compute_and_log_stats(self, data, metric_name, mode, groups=None, stats=None):
+        """Compute and log statistics for the given data.
+        
+        Args:
+            data (torch.Tensor): Tensor containing the data to analyze
+            metric_name (str): Base name for the metric (e.g. 'completion_length')
+            mode (str): Either "train" or "eval"
+            groups (dict, optional): Dictionary mapping group names to boolean masks for data grouping
+            stats (dict, optional): Dictionary mapping stat names to computation functions.
+                                  Defaults to mean, max, min, p25, p75, median
+        """
+        # Default statistics if none provided
+        if stats is None:
+            stats = {
+                'mean': lambda x: x.mean().item(),
+                'max': lambda x: x.max().item(),
+                'min': lambda x: x.min().item(),
+                'p25': lambda x: x.quantile(0.25).item(),
+                'p75': lambda x: x.quantile(0.75).item(),
+                'median': lambda x: x.median().item()
+            }
+        
+        # Compute and log overall statistics
+        for stat_name, stat_func in stats.items():
+            metric_key = f"{metric_name}/{stat_name}" if stat_name != 'mean' else metric_name
+            self._metrics[mode][metric_key].append(stat_func(data))
+        
+        # If groups are provided, compute statistics for each group
+        if groups is not None:
+            for group_name, mask in groups.items():
+                group_data = data[mask]
+                if len(group_data) > 0:  # Only compute stats if group has data
+                    for stat_name, stat_func in stats.items():
+                        metric_key = f"{metric_name}/{group_name}/{stat_name}" if stat_name != 'mean' else f"{metric_name}/{group_name}"
+                        self._metrics[mode][metric_key].append(stat_func(group_data))
 
 
 def main(script_args, training_args, model_args):
