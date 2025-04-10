@@ -378,7 +378,7 @@ class GRPOEntropyTrainer(GRPOTrainer):
         return advantages
     
     def _compute_final_loss(self, per_token_loss, completion_mask):
-        loss = (per_token_loss * completion_mask).sum() # No division by the number of tokens
+        loss = (per_token_loss * completion_mask).sum() / completion_mask.sum()
         return loss
     
     def _compute_and_log_stats(self, data, metric_name, mode, groups=None, stats=None):
