@@ -24,7 +24,7 @@ gradient_checkpointing_kwargs:
 hub_model_id: Qwen-2.5-0.5B-Instruct-Answer-Entropy-RL
 hub_strategy: every_save
 learning_rate: 3.0e-06
-log_completions: false
+log_completions: true
 log_level: info
 logging_first_step: true
 logging_steps: 5
@@ -47,7 +47,14 @@ reward_funcs:
 - format
 - answer_logprob
 - missing_response
+- embedding_entropy
+token_entropy_reduction: mean
+embedding_entropy_reduction: mean # use pca? (mean, max, sum)
+embedding_entropy_similarity: cosine # cosine, (pairwise similarity)
+embedding_entropy_token: last # last, mean, concat
+# embedding_entropy_hidden_state_reduction: (-1, 100) # concat layer idxs in this range # TODO could mean pool too
 reward_weights:
+- 1.0
 - 1.0
 - 1.0
 - 1.0
@@ -55,3 +62,4 @@ reward_weights:
 save_strategy: "no"
 seed: 42
 warmup_ratio: 0.1
+beta: 0.0
