@@ -21,10 +21,10 @@ gradient_accumulation_steps: 18
 gradient_checkpointing: true
 gradient_checkpointing_kwargs:
   use_reentrant: false
-hub_model_id: Qwen-2.5-7B-Simple-RL
+hub_model_id: Qwen-2.5-7B-Token-Entropy-RL
 hub_strategy: every_save
 learning_rate: 3.0e-06
-log_completions: false
+log_completions: true
 log_level: info
 logging_first_step: true
 logging_steps: 5
@@ -35,7 +35,7 @@ max_completion_length: 1024
 max_steps: -1
 num_generations: 8
 num_train_epochs: 1
-output_dir: /scratch-ssd/lucelo/max-ent-llms/data/Qwen-2.5-7B-Simple-RL-v1
+output_dir: /scratch-ssd/lucelo/max-ent-llms/data/Qwen-2.5-7B-Token-Entropy-RL-v1
 overwrite_output_dir: true
 per_device_eval_batch_size: 16
 per_device_train_batch_size: 16
@@ -45,9 +45,12 @@ report_to:
 reward_funcs:
 - accuracy
 - format
+- token_entropy
+token_entropy_reduction: mean
 reward_weights:
 - 1.0
 - 1.0
+- 0.0025 # to be tuned
 save_strategy: "no"
 seed: 42
 warmup_ratio: 0.1

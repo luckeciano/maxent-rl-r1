@@ -5,6 +5,9 @@ import json
 import math
 import re
 from typing import Dict
+import warnings
+import torch
+from collections import Counter
 
 from latex2sympy2_extended import NormalizationConfig
 from math_verify import LatexExtractionConfig, parse, verify
@@ -21,50 +24,128 @@ else:
     AsyncSandbox = None
 
 
-def accuracy_reward(completions, solution, **kwargs):
-    """Reward function that checks if the completion is the same as the ground truth."""
+def parse_answer(content: str, solution: str) -> tuple[bool, list]:
+    """Parse answer and solution, returning whether parsing succeeded and the parsed answers.
+    
+    Args:
+        content: Model completion to parse
+        solution: Ground truth solution to parse
+        
+    Returns:
+        tuple containing:
+        - bool: Whether parsing succeeded
+        - list: List containing [parsed_answer, parsed_solution] if successful
+    """
+    gold_parsed = parse(
+        solution,
+        extraction_mode="first_match",
+        extraction_config=[LatexExtractionConfig()],
+    )
+    
+    if len(gold_parsed) == 0:
+        return False, []
+        
+    answer_parsed = parse(
+        content,
+        extraction_config=[
+            LatexExtractionConfig(
+                normalization_config=NormalizationConfig(
+                    nits=False,
+                    malformed_operators=False,
+                    basic_latex=True,
+                    equations=True,
+                    boxed="all",
+                    units=True,
+                ),
+                # Ensures that boxed is tried first
+                boxed_match_priority=0,
+                try_extract_without_anchor=False,
+            )
+        ],
+        extraction_mode="first_match",
+    )
+    
+    return True, [answer_parsed, gold_parsed]
+
+def compute_accuracy_and_parsed_answers(completions, solution) -> tuple[list[float], list]:
+    """Helper function that computes accuracy rewards and collects parsed answers.
+    
+    Args:
+        completions: List of model completions
+        solution: List of ground truth solutions
+        
+    Returns:
+        tuple containing:
+        - list[float]: Accuracy rewards
+        - list: List of parsed answers (empty strings for failed parses)
+    """
     contents = [completion[0]["content"] for completion in completions]
     rewards = []
+    parsed_answers = []
+    
     for content, sol in zip(contents, solution):
-        gold_parsed = parse(
-            sol,
-            extraction_mode="first_match",
-            extraction_config=[LatexExtractionConfig()],
-        )
-        if len(gold_parsed) != 0:
-            # We require the answer to be provided in correct latex (no malformed operators)
-            answer_parsed = parse(
-                content,
-                extraction_config=[
-                    LatexExtractionConfig(
-                        normalization_config=NormalizationConfig(
-                            nits=False,
-                            malformed_operators=False,
-                            basic_latex=True,
-                            equations=True,
-                            boxed="all",
-                            units=True,
-                        ),
-                        # Ensures that boxed is tried first
-                        boxed_match_priority=0,
-                        try_extract_without_anchor=False,
-                    )
-                ],
-                extraction_mode="first_match",
-            )
-            # Reward 1 if the content is the same as the ground truth, 0 otherwise
-            try:
-                reward = float(verify(answer_parsed, gold_parsed))
-            except Exception as e:
-                print(f"verify failed: {e}, answer: {answer_parsed}, gold: {gold_parsed}")
-                reward = 0.0
-        else:
-            # If the gold solution is not parseable, we reward 1 to skip this example
-            reward = 1.0
+        success, parsed = parse_answer(content, sol)
+        
+        if not success:
+            reward = 1.0  # Skip unparseable examples
             print("Failed to parse gold solution: ", sol)
+            parsed_answers.append("")  # Add empty string for unparseable answers
+        else:
+            try:
+                reward = float(verify(parsed[0], parsed[1]))
+                # Only try to access index if parsed[0] is not empty
+                parsed_answers.append(parsed[0][1] if len(parsed[0]) > 1 else "")
+            except Exception as e:
+                print(f"verify failed: {e}, answer: {parsed[0]}, gold: {parsed[1]}")
+                reward = 0.0
+                parsed_answers.append("")  # Add empty string for verification failures
+                
         rewards.append(reward)
+        
+    return rewards, parsed_answers
 
+def accuracy_reward(completions, solution, **kwargs):
+    """Reward function that checks if the completion is the same as the ground truth."""
+    rewards, _ = compute_accuracy_and_parsed_answers(completions, solution)
     return rewards
+
+def missing_response_penalty(completions, solution, **kwargs):
+    """Reward function that penalizes missing responses."""
+    _, parsed_answers = compute_accuracy_and_parsed_answers(completions, solution)
+    return [-1.0 if answer == "" else 0.0 for answer in parsed_answers]
+
+def answer_logprob_reward(completions, solution, **kwargs):
+    """Reward function that encourages diversity in answers by penalizing frequent answers.
+    
+    Args:
+        completions: List of model completions
+        solution: List of ground truth solutions
+        
+    Returns:
+        List of entropy-based rewards where lower frequency answers get higher rewards
+    """
+    _, parsed_answers = compute_accuracy_and_parsed_answers(completions, solution)
+    
+    if not parsed_answers:
+        return [0.0] * len(completions)
+        
+    # Calculate negative log probabilities to reward rare answers
+    return [-lp for lp in get_answer_logprobs(parsed_answers)]
+
+def get_answer_logprobs(parsed_answers: list) -> list[float]:
+    """Calculate logprobs based on distribution of parsed answers.
+    
+    Args:
+        parsed_answers: List of parsed answers
+        
+    Returns:
+        list[float]: List of log probabilities for each answer
+    """
+    counter = Counter(parsed_answers)
+    total = len(parsed_answers)
+    
+    # Convert counts to log probabilities
+    return [math.log(counter[answer] / total + 1e-10) for answer in parsed_answers]
 
 
 def format_reward(completions, **kwargs):
@@ -444,3 +525,122 @@ async def run_script(sbx: AsyncSandbox, script: str, language: str) -> float:
         return float(execution.text)
     except (TypeError, ValueError):
         return 0.0
+
+def get_token_entropy_reward(reduction: str = "sum"):
+    """
+    Get a token entropy reward function that can be used to calculate the entropy of the tokens in a completion.
+
+    Args:
+        reduction: The reduction method to use for the entropy reward.
+    """       
+
+    def token_entropy_reward(completions, logprobs=None, **kwargs) -> list[float]:
+        """Calculate entropy reward using token log probabilities.
+        
+        Args:
+            completions: List of model completions 
+            logprobs: List of token log probabilities for each completion (shape: (B, T))
+            **kwargs: Additional arguments
+            
+        Returns:
+            List of normalized entropy rewards
+        """
+        if logprobs is None:
+            # warning
+            warnings.warn("logprobs is None, returning 0.0 rewards for all completions")
+            return [0.0] * len(completions)
+
+        # max ent RL for policy gradients is just the sum of the logprobs of the completion tokens
+        # so we just return the sum of the logprobs
+        if reduction == "sum":
+            return torch.sum(-logprobs, dim=1).tolist()
+        elif reduction == "mean":
+            return torch.mean(-logprobs, dim=1).tolist()
+        else:
+            raise ValueError(f"Invalid reduction method: {reduction}")
+
+    return token_entropy_reward
+
+def get_embedding_entropy_reward(
+        embedding_entropy_reduction: str = "mean", # use pca?
+        embedding_entropy_similarity: str = "cosine", # cosine, euclidean
+        embedding_entropy_token: str = "last", # last, mean, concat
+        embedding_entropy_hidden_state_reduction: tuple[int] = (-1, 100), # concat layer idxs in this range
+    ):
+    """
+    Get a reward function that promotes diverse embeddings across generations by penalizing high cosine similarity.
+    
+    Args:
+        embedding_entropy_reduction: The reduction method to use for the entropy reward.
+        embedding_entropy_similarity: The similarity metric to use for the entropy reward.
+        embedding_entropy_token: The token to use for the entropy reward.
+        embedding_entropy_hidden_state_reduction: The hidden state reduction method to use for the entropy reward.
+        max_similarity: Maximum allowed cosine similarity between embeddings (0.0 to 1.0)
+    """
+    def embedding_entropy_reward(completions, hidden_states=None, num_generations=None, **kwargs) -> list[float]:
+        """Calculate reward based on embedding similarity between generations.
+        
+        Args:
+            completions: List of model completions
+            hidden_states: Hidden states (num_layers, B, L, H)
+            num_generations: Number of generations per prompt
+            **kwargs: Additional arguments
+            
+        Returns:
+            List of rewards where higher values indicate more diverse embeddings
+        """
+        if hidden_states is None:
+            warnings.warn("hidden_states is None, returning 0.0 rewards for all completions")
+            return [0.0] * len(completions)
+            
+        if num_generations is None or num_generations == 1:
+            warnings.warn("num_generations is None or 1, returning 0.0 rewards for all completions")
+            return [0.0] * len(completions)
+        
+        # get the correct layer, concat layers in this range (B, L, H)
+        embeddings = hidden_states.permute(1,2,0,3)[:,:,embedding_entropy_hidden_state_reduction[0]:embedding_entropy_hidden_state_reduction[1],:]
+        embeddings = embeddings.reshape(embeddings.size(0), -1, embeddings.size(-1))    # (B, L, H*num_layers)
+        # get the correct token (B, H)
+        if embedding_entropy_token == "last":
+            # TODO using -2 to exclude the eos token, correct?
+            embeddings = embeddings[:, -2, :]
+        elif embedding_entropy_token == "mean":
+            embeddings = embeddings.mean(dim=1)  # (B, H*num_selected_layers)
+        elif embedding_entropy_token == "concat":
+            embeddings = embeddings.reshape(embeddings.size(0), -1)  # (B, L*H*num_selected_layers)
+        else:
+            raise ValueError(f"Invalid token: {embedding_entropy_token}")
+        
+        # Reshape to group by prompt (num_generations per prompt)
+        embeddings = embeddings.view(-1, num_generations, embeddings.size(-1))  # (B/G, G, H)
+        # Normalize embeddings
+        embeddings_norm = embeddings / (embeddings.norm(dim=-1, keepdim=True) + 1e-8)     
+        if embedding_entropy_similarity == "cosine":
+            # Compute cosine similarity between all pairs of embeddings within each group
+            similarity = torch.matmul(embeddings_norm, embeddings_norm.transpose(-2, -1))  # (B/G, G, G)       
+            # Mask out self-similarity
+            mask = torch.eye(similarity.size(-1), dtype=torch.bool, device=similarity.device)
+            similarity = similarity * (~mask)
+        else:
+            raise ValueError(f"Invalid similarity metric: {embedding_entropy_similarity}")
+            
+        # we want to maximize diversity, so we reward negative similarity
+        rewards = -similarity  # (B/G, G, G)
+        
+        if embedding_entropy_reduction == "max":
+            # For each generation, get max similarity to other generations
+            rewards = rewards.max(dim=-1)[0]  # (B/G, G)
+        elif embedding_entropy_reduction == "mean":
+            # For each generation, get mean similarity to other generations
+            rewards = rewards.sum(dim=-1) / (num_generations - 1)  # (B/G, G) 
+        elif embedding_entropy_reduction == "sum":
+            # For each generation, get sum of similarities to other generations
+            rewards = rewards.sum(dim=-1)  # (B/G, G)
+        else:
+            raise ValueError(f"Invalid reduction method: {embedding_entropy_reduction}")
+
+        # Flatten rewards across batches and generations
+        rewards = rewards.reshape(-1)
+        return rewards.tolist()
+
+    return embedding_entropy_reward

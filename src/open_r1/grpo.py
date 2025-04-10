@@ -17,12 +17,14 @@ import os
 import sys
 from dataclasses import dataclass, field
 
+
 import datasets
 import torch
 import transformers
 from datasets import load_dataset
 from transformers import set_seed
 from transformers.trainer_utils import get_last_checkpoint
+from accelerate.utils import  set_seed
 
 from open_r1.configs import GRPOConfig
 from open_r1.rewards import (
@@ -32,14 +34,21 @@ from open_r1.rewards import (
     get_code_format_reward,
     get_cosine_scaled_reward,
     get_repetition_penalty_reward,
+    get_token_entropy_reward,
     len_reward,
     reasoning_steps_reward,
     tag_count_reward,
+    get_embedding_entropy_reward,
+    answer_logprob_reward,
+    missing_response_penalty,
 )
 from open_r1.utils import get_tokenizer
 from open_r1.utils.callbacks import get_callbacks
 from open_r1.utils.wandb_logging import init_wandb_training
 from trl import GRPOTrainer, ModelConfig, ScriptArguments, TrlParser, get_peft_config
+
+from open_r1.grpo_entropy_trainer import GRPOEntropyTrainer
+from open_r1.dr_grpo_trainer import DrGRPOTrainer
 
 
 logger = logging.getLogger(__name__)
@@ -52,7 +61,7 @@ class GRPOScriptArguments(ScriptArguments):
 
     Args:
         reward_funcs (`list[str]`):
-            List of reward functions. Possible values: 'accuracy', 'format', 'reasoning_steps', 'cosine', 'repetition_penalty', 'length', 'tag_count', 'code', 'code_format'.
+            List of reward functions. Possible values: 'accuracy', 'format', 'reasoning_steps', 'cosine', 'repetition_penalty', 'length', 'tag_count', 'code', 'code_format', 'token_entropy', 'embedding_similarity'.
         cosine_min_value_wrong (`float`):
             Minimum reward for cosine scaling for wrong answers.
         cosine_max_value_wrong (`float`):
@@ -70,8 +79,13 @@ class GRPOScriptArguments(ScriptArguments):
     reward_funcs: list[str] = field(
         default_factory=lambda: ["accuracy", "format", "tag_count"],
         metadata={
-            "help": "List of reward functions. Possible values: 'accuracy', 'format', 'reasoning_steps', 'cosine', 'repetition_penalty', 'length', tag_count', 'code', 'code_format'"
+            "help": "List of reward functions. Possible values: 'accuracy', 'format', 'reasoning_steps', 'cosine', 'repetition_penalty', 'length', tag_count', 'code', 'code_format', 'token_entropy', 'embedding_entropy'"
         },
+    )
+
+    trainer: str = field(
+        default="GRPOEntropyTrainer",
+        metadata={"help": "Trainer class to use. Default: GRPOEntropyTrainer"},
     )
     cosine_min_value_wrong: float = field(
         default=0.0,
@@ -107,6 +121,26 @@ class GRPOScriptArguments(ScriptArguments):
             "help": "Language for code format reward. Based on E2B supported languages https://e2b.dev/docs/code-interpreting/supported-languages",
             "choices": ["python", "javascript", "r", "java", "bash"],
         },
+    )
+    token_entropy_reduction: str = field(
+        default="sum",
+        metadata={"help": "Reduction method for token entropy reward. Possible values: 'sum', 'mean'"},
+    )
+    embedding_entropy_reduction: str = field(
+        default="mean",
+        metadata={"help": "Reduction method for embedding entropy reward. Possible values: 'sum', 'mean'"},
+    )
+    embedding_entropy_similarity: str = field(
+        default="cosine",
+        metadata={"help": "Similarity metric for embedding entropy reward. Possible values: 'cosine', 'euclidean'"},
+    )
+    embedding_entropy_token: str = field(
+        default="last",
+        metadata={"help": "Token to use for embedding entropy reward. Possible values: 'last', 'mean', 'concat'"},
+    )
+    embedding_entropy_hidden_state_reduction: str = field(
+        default=(-1, 100),
+        metadata={"help": "Hidden states used for embedding entropy reward. Format: [start_layer, end_layer]"},
     )
 
 
@@ -156,8 +190,8 @@ def main(script_args, training_args, model_args):
     ################
     tokenizer = get_tokenizer(model_args, training_args)
 
-    # Get reward functions
-    REWARD_FUNCS_REGISTRY = {
+    # Map reward functions to their implementations
+    reward_mapping = {
         "accuracy": accuracy_reward,
         "format": format_reward,
         "reasoning_steps": reasoning_steps_reward,
@@ -173,11 +207,20 @@ def main(script_args, training_args, model_args):
             max_penalty=script_args.repetition_max_penalty,
         ),
         "length": len_reward,
+        "tag_count": tag_count_reward,
         "code": code_reward,
         "code_format": get_code_format_reward(language=script_args.code_language),
-        "tag_count": tag_count_reward,
+        "token_entropy": get_token_entropy_reward(reduction=script_args.token_entropy_reduction),
+        "embedding_entropy": get_embedding_entropy_reward(
+            embedding_entropy_reduction=script_args.embedding_entropy_reduction,
+            embedding_entropy_similarity=script_args.embedding_entropy_similarity,
+            embedding_entropy_token=script_args.embedding_entropy_token,
+            embedding_entropy_hidden_state_reduction=script_args.embedding_entropy_hidden_state_reduction,
+        ),
+        "answer_logprob": answer_logprob_reward,
+        "missing_response": missing_response_penalty,
     }
-    reward_funcs = [REWARD_FUNCS_REGISTRY[func] for func in script_args.reward_funcs]
+    reward_funcs = [reward_mapping[func] for func in script_args.reward_funcs]
 
     # Format into conversation
     def make_conversation(example):
@@ -211,7 +254,8 @@ def main(script_args, training_args, model_args):
     #############################
     # Initialize the GRPO trainer
     #############################
-    trainer = GRPOTrainer(
+    trainer_class = globals().get(script_args.trainer, GRPOEntropyTrainer)
+    trainer = trainer_class(
         model=model_args.model_name_or_path,
         reward_funcs=reward_funcs,
         args=training_args,

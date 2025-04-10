@@ -5,9 +5,10 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --exclusive
 #SBATCH --job-name="act-pm"
-#SBATCH --output=/users/lucelo/logs/slurm-%j.out
-#SBATCH --error=/users/lucelo/logs/slurm-%j.err
+#SBATCH --output=/users/shrlik/Projects/llm/maxent-rl-r1/logs/slurm-%j.out
+#SBATCH --error=/users/shrlik/Projects/llm/maxent-rl-r1/logs/slurm-%j.err
 
+source ./.env
 export CONDA_ENVS_PATH=/scratch-ssd/$USER/conda_envs
 export CONDA_PKGS_DIRS=/scratch-ssd/$USER/conda_pkgs
 export XDG_CACHE_HOME=/scratch-ssd/oatml/
@@ -26,6 +27,7 @@ export PYTHONWARNINGS="ignore::DeprecationWarning"
 source /scratch-ssd/oatml/miniconda3/bin/activate maxent-r1
 
 cd ~/maxent-rl-r1
+echo "pwd: $(pwd)"
 pip install --no-cache-dir --upgrade pip
 pip install --no-cache-dir -e ".[dev]"
 
