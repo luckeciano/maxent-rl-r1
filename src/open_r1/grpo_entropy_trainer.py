@@ -3,8 +3,9 @@ from typing import Any, Union
 import torch
 import torch.nn as nn
 import wandb
+import re
 
-from transformers import Trainer
+from transformers import StoppingCriteria, StoppingCriteriaList, Trainer
 from accelerate.utils import broadcast_object_list, gather, gather_object
 
 from trl import GRPOTrainer
@@ -14,6 +15,35 @@ from trl.trainer.utils import (
     pad,
     selective_log_softmax,
 )
+
+
+class BoxedAnswerStoppingCriteria(StoppingCriteria):
+    def __init__(self, tokenizer, max_length=None):
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        # Regex to check for complete boxed expressions in both inline and display math modes
+        self.boxed_pattern = re.compile(r'(?:\\\(|\\\[|\$)\s*\\boxed\{[^{}]*\}\s*(?:\\\)|\\\]|\$)')
+
+    def __call__(self, input_ids, scores, **kwargs):
+        batch_size = input_ids.shape[0]
+        should_stop = torch.zeros(batch_size, dtype=torch.bool, device=input_ids.device)
+        
+        # Get last 40 tokens for each sequence in batch
+        last_tokens = input_ids[:, -40:]
+        
+        # Decode sequences
+        last_texts = self.tokenizer.batch_decode(last_tokens, skip_special_tokens=True)
+        
+        # Check for boxed expressions
+        has_boxed = [bool(self.boxed_pattern.search(text)) for text in last_texts]
+        should_stop = torch.tensor(has_boxed, dtype=torch.bool, device=input_ids.device)
+        
+        # Check max length condition
+        if self.max_length is not None:
+            reached_max_length = (input_ids.shape[1] >= self.max_length)
+            should_stop = should_stop | reached_max_length
+            
+        return should_stop
 
 
 class GRPOEntropyTrainer(GRPOTrainer):
@@ -53,7 +83,7 @@ class GRPOEntropyTrainer(GRPOTrainer):
         else:
             return log_probs
 
-    # override the _generate_and_score_completions method to pass logprobs to the entropy reward function
+    # override the _generate_and_score_completions method to pass logprobs to the entropy reward function
     def _generate_and_score_completions(
         self, inputs: dict[str, Union[torch.Tensor, Any]]
     ) -> dict[str, Union[torch.Tensor, Any]]:
@@ -69,6 +99,14 @@ class GRPOEntropyTrainer(GRPOTrainer):
         if self.max_prompt_length is not None:
             prompt_ids = prompt_ids[:, -self.max_prompt_length :]
             prompt_mask = prompt_mask[:, -self.max_prompt_length :]
+
+        # Create stopping criteria
+        stopping_criteria = StoppingCriteriaList([
+            BoxedAnswerStoppingCriteria(
+                tokenizer=self.processing_class,
+                max_length=self.generation_config.max_new_tokens
+            )
+        ])
 
         # Generate completions using either vLLM or regular generation
         if self.args.use_vllm:
@@ -110,7 +148,10 @@ class GRPOEntropyTrainer(GRPOTrainer):
             # Regular generation path
             with unwrap_model_for_generation(self.model, self.accelerator) as unwrapped_model:
                 prompt_completion_ids = unwrapped_model.generate(
-                    prompt_ids, attention_mask=prompt_mask, generation_config=self.generation_config
+                    prompt_ids, 
+                    attention_mask=prompt_mask, 
+                    generation_config=self.generation_config,
+                    stopping_criteria=stopping_criteria
                 )
 
             # Compute prompt length and extract completion ids
@@ -118,7 +159,7 @@ class GRPOEntropyTrainer(GRPOTrainer):
             prompt_ids = prompt_completion_ids[:, :prompt_length]
             completion_ids = prompt_completion_ids[:, prompt_length:]
 
-        # Mask everything after the first EOS token
+        # Mask everything after the first EOS token or boxed answer
         is_eos = completion_ids == self.processing_class.eos_token_id
         eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=device)
         eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
@@ -130,7 +171,6 @@ class GRPOEntropyTrainer(GRPOTrainer):
 
         logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
 
-        # TODO extract hidden states here too for other reward functions
         with torch.inference_mode():
             # When using num_iterations == 1, old_per_token_logps == per_token_logps, so we can skip it's
             # computation here, and use per_token_logps.detach() instead.
