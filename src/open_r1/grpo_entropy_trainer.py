@@ -40,9 +40,9 @@ class BoxedAnswerStoppingCriteria(StoppingCriteria):
         
         # Check max length condition
         if self.max_length is not None:
-            reached_max_length = (input_ids.shape[1] >= self.max_length)
+            reached_max_length = (input_ids.shape[-1] >= self.max_length)
             should_stop = should_stop | reached_max_length
-            
+
         return should_stop
 
 
@@ -159,7 +159,7 @@ class GRPOEntropyTrainer(GRPOTrainer):
             prompt_ids = prompt_completion_ids[:, :prompt_length]
             completion_ids = prompt_completion_ids[:, prompt_length:]
 
-        # Mask everything after the first EOS token or boxed answer
+        # Mask everything after the first EOS token
         is_eos = completion_ids == self.processing_class.eos_token_id
         eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=device)
         eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
