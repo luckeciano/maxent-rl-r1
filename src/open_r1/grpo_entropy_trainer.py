@@ -22,9 +22,9 @@ class BoxedAnswerStoppingCriteria(StoppingCriteria):
         self.tokenizer = tokenizer
         self.max_length = max_length
         # Regex to check for complete boxed expressions in both inline and display math modes
-        self.boxed_pattern = re.compile(r'(?:\\\(|\\\[|\$)\s*\\boxed\{[^{}]*\}\s*(?:\\\)|\\\]|\$)')
+        # self.boxed_pattern = re.compile(r'(?:\\\(|\\\[|\$)\s*\\boxed\{[^{}]*\}\s*(?:\\\)|\\\]|\$)')
         # Also matches standalone \boxed{...} expressions with balanced braces inside
-        # self.boxed_pattern = re.compile(r'(?:\\\(|\\\[|\$)?\s*\\boxed\{(?:[^{}]|{(?:[^{}]|{[^{}]*})*})*\}\s*(?:\\\)|\\\]|\$)?')
+        self.boxed_pattern = re.compile(r'(?:\\\(|\\\[|\$)?\s*\\boxed\{(?:[^{}]|{(?:[^{}]|{[^{}]*})*})*\}\s*(?:\\\)|\\\]|\$)?')
 
     def __call__(self, input_ids, scores, **kwargs):
         batch_size = input_ids.shape[0]
