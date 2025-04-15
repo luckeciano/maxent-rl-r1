@@ -28,8 +28,8 @@ class BoxedAnswerStoppingCriteria(StoppingCriteria):
         batch_size = input_ids.shape[0]
         should_stop = torch.zeros(batch_size, dtype=torch.bool, device=input_ids.device)
         
-        # Get last 40 tokens for each sequence in batch
-        last_tokens = input_ids[:, -40:]
+        # Get last 100 tokens for each sequence in batch
+        last_tokens = input_ids[:, -100:]
         
         # Decode sequences
         last_texts = self.tokenizer.batch_decode(last_tokens, skip_special_tokens=True)
