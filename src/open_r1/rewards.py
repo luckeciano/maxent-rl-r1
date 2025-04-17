@@ -566,6 +566,8 @@ def get_embedding_entropy_reward(
         embedding_entropy_similarity: str = "cosine", # cosine, euclidean
         embedding_entropy_token: str = "last", # last, mean, concat
         embedding_entropy_hidden_state_reduction: tuple[int] = (-1, 100), # concat layer idxs in this range
+        embedding_entropy_grouping: str = "all", # all, correct_incorrect
+        embedding_entropy_zero_out_incorrect: bool = True,  # zero out rewards for incorrect generations
     ):
     """
     Get a reward function that promotes diverse embeddings across generations by penalizing high cosine similarity.
@@ -575,9 +577,10 @@ def get_embedding_entropy_reward(
         embedding_entropy_similarity: The similarity metric to use for the entropy reward.
         embedding_entropy_token: The token to use for the entropy reward.
         embedding_entropy_hidden_state_reduction: The hidden state reduction method to use for the entropy reward.
-        max_similarity: Maximum allowed cosine similarity between embeddings (0.0 to 1.0)
+        embedding_entropy_grouping: The grouping method to use for the entropy reward.
+        embedding_entropy_zero_out_incorrect: Whether to zero out rewards for incorrect generations.
     """
-    def embedding_entropy_reward(completions, hidden_states=None, num_generations=None, **kwargs) -> list[float]:
+    def embedding_entropy_reward(completions, hidden_states=None, num_generations=None, solution=None, **kwargs) -> list[float]:
         """Calculate reward based on embedding similarity between generations.
         
         Args:
@@ -611,16 +614,38 @@ def get_embedding_entropy_reward(
         else:
             raise ValueError(f"Invalid token: {embedding_entropy_token}")
         
+        # compute accuracy
+        if embedding_entropy_grouping == "correct_incorrect" and solution is not None:
+            # compute accuracy
+            accuracy_rewards, _ = compute_accuracy_and_parsed_answers(completions, solution)
+            accuracy_mask = torch.tensor([r > 0.0 for r in accuracy_rewards], device=embeddings.device)
+        elif embedding_entropy_grouping == "all":
+            accuracy_mask = torch.ones(embeddings.size(0), device=embeddings.device, dtype=torch.bool)
+        else:
+            raise ValueError(f"Invalid grouping method: {embedding_entropy_grouping}")
+        
         # Reshape to group by prompt (num_generations per prompt)
         embeddings = embeddings.view(-1, num_generations, embeddings.size(-1))  # (B/G, G, H)
+        accuracy_mask = accuracy_mask.view(-1, num_generations) # (B/G, G)
+
         # Normalize embeddings
-        embeddings_norm = embeddings / (embeddings.norm(dim=-1, keepdim=True) + 1e-8)     
+        embeddings_norm = embeddings / (embeddings.norm(dim=-1, keepdim=True) + 1e-8)
+
         if embedding_entropy_similarity == "cosine":
             # Compute cosine similarity between all pairs of embeddings within each group
-            similarity = torch.matmul(embeddings_norm, embeddings_norm.transpose(-2, -1))  # (B/G, G, G)       
+            similarity = torch.matmul(embeddings_norm, embeddings_norm.transpose(-2, -1))  # (B/G, G, G)    
+            # mask out embeddings with different accuracy
+            same_accuracy_mask = (accuracy_mask.unsqueeze(1) == accuracy_mask.unsqueeze(2))    # (B/G, G, G)
+
             # Mask out self-similarity
-            mask = torch.eye(similarity.size(-1), dtype=torch.bool, device=similarity.device)
-            similarity = similarity * (~mask)
+            self_mask = ~torch.eye(similarity.size(-1), dtype=torch.bool, device=similarity.device).unsqueeze(0) # (1, G, G)
+            mask = same_accuracy_mask & self_mask # (B/G, G, G)
+            # optionally zero out rewards for incorrect generations
+            if embedding_entropy_zero_out_incorrect:
+                mask = mask & accuracy_mask.unsqueeze(1)
+            # count number of embeddings in the group
+            counts = mask.sum(dim=2)  # shape (B, G)
+            similarity = similarity * mask
         else:
             raise ValueError(f"Invalid similarity metric: {embedding_entropy_similarity}")
             
@@ -632,15 +657,17 @@ def get_embedding_entropy_reward(
             rewards = rewards.max(dim=-1)[0]  # (B/G, G)
         elif embedding_entropy_reduction == "mean":
             # For each generation, get mean similarity to other generations
-            rewards = rewards.sum(dim=-1) / (num_generations - 1)  # (B/G, G) 
+            rewards = rewards.sum(dim=-1)
+            rewards = torch.where(counts > 0, rewards / counts, torch.zeros_like(rewards))  # avoid division by zero
         elif embedding_entropy_reduction == "sum":
             # For each generation, get sum of similarities to other generations
             rewards = rewards.sum(dim=-1)  # (B/G, G)
         else:
             raise ValueError(f"Invalid reduction method: {embedding_entropy_reduction}")
 
-        # Flatten rewards across batches and generations
+        # flatten rewards across batches and generations
         rewards = rewards.reshape(-1)
+
         return rewards.tolist()
 
     return embedding_entropy_reward

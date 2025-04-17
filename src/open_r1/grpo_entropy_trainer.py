@@ -223,14 +223,16 @@ class GRPOEntropyTrainer(GRPOTrainer):
                     rewards_per_func[:, i] = reward_func(**reward_inputs).logits[:, 0]  # Shape (B*G,)
             elif "entropy" in reward_func.__name__:
                 # Pass logprobs to the entropy reward function
-                # TODO hidden states might be too large to pass to the reward function after gathering
+                keys = [key for key in inputs[0] if key not in ["prompt", "completion"]]
+                reward_kwargs = {key: [example[key] for example in inputs] for key in keys}
                 output_reward_func = reward_func(
                     prompts=prompts, 
                     completions=completions, 
                     logprobs=old_per_token_logps, 
                     hidden_states=old_last_token_embeddings, 
                     completion_ids=completion_ids,
-                    num_generations=self.num_generations
+                    num_generations=self.num_generations,
+                    **reward_kwargs
                 )
                 rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
             else:

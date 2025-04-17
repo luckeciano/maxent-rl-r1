@@ -138,6 +138,14 @@ class GRPOScriptArguments(ScriptArguments):
         default="last",
         metadata={"help": "Token to use for embedding entropy reward. Possible values: 'last', 'mean', 'concat'"},
     )
+    embedding_entropy_grouping: str = field(
+        default="all",
+        metadata={"help": "Grouping method for embedding entropy reward. Reward is computed for each group separately. Possible values: 'all', 'correct_incorrect'"},
+    )
+    embedding_entropy_zero_out_incorrect: bool = field(
+        default=False,
+        metadata={"help": "Zero out embedding entropy rewards for incorrect generations"},
+    )
     embedding_entropy_hidden_state_reduction: str = field(
         default=(-1, 100),
         metadata={"help": "Hidden states used for embedding entropy reward. Format: [start_layer, end_layer]"},
@@ -216,6 +224,8 @@ def main(script_args, training_args, model_args):
             embedding_entropy_similarity=script_args.embedding_entropy_similarity,
             embedding_entropy_token=script_args.embedding_entropy_token,
             embedding_entropy_hidden_state_reduction=script_args.embedding_entropy_hidden_state_reduction,
+            embedding_entropy_grouping=script_args.embedding_entropy_grouping,
+            embedding_entropy_zero_out_incorrect=script_args.embedding_entropy_zero_out_incorrect,
         ),
         "answer_logprob": answer_logprob_reward,
         "missing_response": missing_response_penalty,
