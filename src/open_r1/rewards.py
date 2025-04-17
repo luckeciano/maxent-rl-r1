@@ -617,7 +617,7 @@ def get_embedding_entropy_reward(
         # compute accuracy
         if embedding_entropy_grouping == "correct_incorrect" and solution is not None:
             # compute accuracy
-            accuracy_rewards, _ = compute_accuracy_and_parsed_answers(completions, solution)
+            accuracy_rewards = accuracy_reward(completions, solution)
             accuracy_mask = torch.tensor([r > 0.0 for r in accuracy_rewards], device=embeddings.device)
         elif embedding_entropy_grouping == "all":
             accuracy_mask = torch.ones(embeddings.size(0), device=embeddings.device, dtype=torch.bool)
