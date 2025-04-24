@@ -216,10 +216,7 @@ class ActorCriticTrainer(GRPOEntropyTrainer):
 
         # Convert value to scalar
         return min_reward + value * interval_size
-    
-    def _compute_value_loss(self, log_probs, target_ids):
-        loss = F.nll_loss(log_probs, target_ids)
-        return loss
+
     
     def _compute_soft_value_loss(self, log_probs, target_ids, smoothing=0.1):
         n_classes = log_probs.size(-1)
