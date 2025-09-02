@@ -91,6 +91,7 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
         self.fisher_global_mask_tau = kwargs['args'].fisher_global_mask_tau
         self.curvature_masking = any([self.hessian_token_mask_tau, self.fisher_token_mask_tau, self.hessian_sentence_mask_tau, \
                                       self.fisher_sentence_mask_tau, self.hessian_global_mask_tau, self.fisher_global_mask_tau])
+        self.sequential_masking = kwargs['args'].sequential_masking
 
 
     def _get_and_smooth_token_logps(self, model, input_ids, attention_mask, logits_to_keep, mode, return_hidden_states=False, return_entropy=False):
@@ -263,13 +264,17 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
 
         ###### Re-evaluate gradients and curvatures after curvature masking ######
         if self.curvature_masking:
-            curvature_mask_hessian, _ = self._compute_hessian_curvature_mask(full_update_term, completion_mask)
-            curvature_mask_fisher, _ = self._compute_fisher_curvature_mask(approx_kl, completion_mask)
-            updated_mask = completion_mask * curvature_mask_hessian * curvature_mask_fisher
+            if self.sequential_masking:
+                curvature_mask, masks_hessian, masks_fisher = self._compute_curvature_sequential_mask(full_update_term, completion_mask, hidden_states, per_token_logps, probs, action_one_hot, inputs, top_k_token_ids, mode)
+                updated_mask = completion_mask * curvature_mask
+            else:
+                curvature_mask_hessian, masks_hessian = self._compute_hessian_curvature_mask(full_update_term, completion_mask)
+                curvature_mask_fisher, masks_fisher = self._compute_fisher_curvature_mask(approx_kl, completion_mask)
+                updated_mask = completion_mask * curvature_mask_hessian * curvature_mask_fisher
 
-            # Evaluate the gradients and curvatures after the curvature masking
-            self._compute_and_log_gradients_linear_model(hidden_states, per_token_logps, probs, action_one_hot, inputs, updated_mask, top_k_token_ids, mode, prefix="masked")
-        
+                # Evaluate the gradients and curvatures after the curvature masking
+                self._compute_and_log_gradients_linear_model(hidden_states, per_token_logps, probs, action_one_hot, inputs, updated_mask, top_k_token_ids, mode, prefix="masked")
+            
         torch.cuda.empty_cache()
         gathered_entropy = self._gather_masked_tensor_across_processes(entropy, completion_mask)
         self._accumulate_stats(
@@ -315,12 +320,19 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
                 raise ValueError(f"Invalid entropy estimator: {self.entropy_estimator}")
 
         curvature_estimator = {}
+        masks = {}
         if full_update_term is not None:
             curvature_estimator["hessian"] = full_update_term
         if approx_kl is not None:
             curvature_estimator["fisher"] = approx_kl
+        if self.curvature_masking:
+            masks["hessian"] = masks_hessian
+            masks["fisher"] = masks_fisher
+        else:
+            updated_mask = completion_mask
+            
         
-        loss = self._compute_final_loss(per_token_loss, completion_mask, curvature_estimator, completion_ids)
+        loss = self._compute_final_loss(per_token_loss, completion_mask, updated_mask, masks, curvature_estimator, completion_ids)
 
         if self.beta != 0.0:
             mean_kl = ((per_token_kl * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
@@ -860,24 +872,13 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
             return curvature_mask, { "total": curvature_mask }
 
         masks = {}
-        if self.hessian_token_mask_tau != 0.0:
-            curvature_mask_token = (full_update_term["token"] < self.hessian_token_mask_tau) * (full_update_term["token"] >= 0.0)
-            masks["token"] = curvature_mask_token
-            curvature_mask = curvature_mask * curvature_mask_token
-        
-        if self.hessian_sentence_mask_tau != 0.0:
-            curvature_mask_sentence = ((full_update_term["sentence"] < self.hessian_sentence_mask_tau) * (full_update_term["sentence"] >= 0.0)).unsqueeze(-1).expand_as(completion_mask)
-            masks["sentence"] = curvature_mask_sentence
-            curvature_mask = curvature_mask * curvature_mask_sentence
-
-        if self.hessian_global_mask_tau != 0.0:
-            curvature_mask_global = ((full_update_term["global"] < self.hessian_global_mask_tau) * (full_update_term["global"] >= 0.0)).unsqueeze(-1).expand_as(completion_mask)
-            masks["global"] = curvature_mask_global
-            curvature_mask = curvature_mask * curvature_mask_global
+        curvature_mask = self._compute_hessian_token_mask(full_update_term, curvature_mask, masks)
+        curvature_mask = self._compute_hessian_sentence_mask(full_update_term, curvature_mask, masks)
+        curvature_mask = self._compute_hessian_global_mask(full_update_term, curvature_mask, masks)
 
         masks["total"] = curvature_mask
         return curvature_mask, masks
-    
+
     def _compute_fisher_curvature_mask(self, approx_kl, completion_mask):
         curvature_mask = torch.ones_like(completion_mask)
 
@@ -885,23 +886,97 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
             return curvature_mask, { "total": curvature_mask }
 
         masks = {}
-        if self.fisher_token_mask_tau != 0.0:
-            curvature_mask_token = (approx_kl["token"] < self.fisher_token_mask_tau)
-            masks["token"] = curvature_mask_token
-            curvature_mask = curvature_mask * curvature_mask_token
-        
-        if self.fisher_sentence_mask_tau != 0.0:
-            curvature_mask_sentence = (approx_kl["sentence"] < self.fisher_sentence_mask_tau).unsqueeze(-1).expand_as(completion_mask)
-            masks["sentence"] = curvature_mask_sentence
-            curvature_mask = curvature_mask * curvature_mask_sentence
-
-        if self.fisher_global_mask_tau != 0.0:
-            curvature_mask_global = (approx_kl["global"] < self.fisher_global_mask_tau).unsqueeze(-1).expand_as(completion_mask)
-            masks["global"] = curvature_mask_global
-            curvature_mask = curvature_mask * curvature_mask_global
+        curvature_mask = self._compute_fisher_token_mask(approx_kl, curvature_mask, masks)
+        curvature_mask = self._compute_fisher_sentence_mask(approx_kl, curvature_mask, masks)
+        curvature_mask = self._compute_fisher_global_mask(approx_kl, curvature_mask, masks)
 
         masks["total"] = curvature_mask
         return curvature_mask, masks
+
+    def _compute_curvature_sequential_mask(self, full_update_term, completion_mask, \
+                                        hidden_states, per_token_logps, probs, action_one_hot, inputs, top_k_token_ids, mode):
+        curvature_mask = torch.ones_like(completion_mask)
+        if full_update_term is None:
+            return curvature_mask, { "total": curvature_mask }, { "total": curvature_mask }
+        
+        masks_hessian = {}
+        masks_fisher = {}
+
+        # clone completion_mask
+        updated_mask = completion_mask.clone()
+        if self.hessian_token_mask_tau != 0.0 or self.fisher_token_mask_tau != 0.0:
+            curvature_mask_hessian_token = self._compute_hessian_token_mask(full_update_term, updated_mask, masks_hessian)
+            curvature_mask_fisher_token = self._compute_fisher_token_mask(full_update_term, updated_mask, masks_fisher)
+            updated_mask = updated_mask * curvature_mask_hessian_token * curvature_mask_fisher_token
+
+                # Evaluate the gradients and curvatures after the curvature masking
+            self._compute_and_log_gradients_linear_model(hidden_states, per_token_logps, probs, action_one_hot, inputs, updated_mask, top_k_token_ids, mode, prefix="after_token_mask")
+
+        if self.hessian_sentence_mask_tau != 0.0 or self.fisher_sentence_mask_tau != 0.0:
+            curvature_mask_hessian_sentence = self._compute_hessian_sentence_mask(full_update_term, updated_mask, masks_hessian)
+            curvature_mask_fisher_sentence = self._compute_fisher_sentence_mask(full_update_term, updated_mask, masks_fisher)
+            updated_mask = updated_mask * curvature_mask_hessian_sentence * curvature_mask_fisher_sentence
+
+            # Evaluate the gradients and curvatures after the curvature masking
+            self._compute_and_log_gradients_linear_model(hidden_states, per_token_logps, probs, action_one_hot, inputs, updated_mask, top_k_token_ids, mode, prefix="after_sentence_mask")
+        
+        if self.hessian_global_mask_tau != 0.0 or self.fisher_global_mask_tau != 0.0:
+            curvature_mask_hessian_global = self._compute_hessian_global_mask(full_update_term, updated_mask, masks_hessian)
+            curvature_mask_fisher_global = self._compute_fisher_global_mask(full_update_term, updated_mask, masks_fisher)
+            updated_mask = updated_mask * curvature_mask_hessian_global * curvature_mask_fisher_global
+
+            # Evaluate the gradients and curvatures after the curvature masking
+            self._compute_and_log_gradients_linear_model(hidden_states, per_token_logps, probs, action_one_hot, inputs, updated_mask, top_k_token_ids, mode, prefix="after_global_mask")
+        
+        return updated_mask, masks_hessian, masks_fisher
+    
+    def _compute_hessian_token_mask(self, full_update_term, curvature_mask, masks):
+        if self.hessian_token_mask_tau != 0.0:
+            curvature_mask_token = (full_update_term["token"] < self.hessian_token_mask_tau) * (full_update_term["token"] >= 0.0)
+            masks["token"] = curvature_mask_token
+            masks["total"] = masks["total"] * curvature_mask_token if "total" in masks else curvature_mask_token
+            curvature_mask = curvature_mask * curvature_mask_token
+        return curvature_mask
+
+    def _compute_hessian_sentence_mask(self, full_update_term, curvature_mask, masks):
+        if self.hessian_sentence_mask_tau != 0.0:
+            curvature_mask_sentence = ((full_update_term["sentence"] < self.hessian_sentence_mask_tau) * (full_update_term["sentence"] >= 0.0)).unsqueeze(-1).expand_as(curvature_mask)
+            masks["sentence"] = curvature_mask_sentence
+            masks["total"] = masks["total"] * curvature_mask_sentence if "total" in masks else curvature_mask_sentence
+            curvature_mask = curvature_mask * curvature_mask_sentence
+        return curvature_mask
+    
+    def _compute_hessian_global_mask(self, full_update_term, curvature_mask, masks):
+        if self.hessian_global_mask_tau != 0.0:
+            curvature_mask_global = ((full_update_term["global"] < self.hessian_global_mask_tau) * (full_update_term["global"] >= 0.0)).unsqueeze(-1).expand_as(curvature_mask)
+            masks["global"] = curvature_mask_global
+            masks["total"] = masks["total"] * curvature_mask_global if "total" in masks else curvature_mask_global
+            curvature_mask = curvature_mask * curvature_mask_global
+        return curvature_mask
+
+    def _compute_fisher_token_mask(self, approx_kl, curvature_mask, masks):
+        if self.fisher_token_mask_tau != 0.0:
+            curvature_mask_token = (approx_kl["token"] < self.fisher_token_mask_tau)
+            masks["token"] = curvature_mask_token
+            masks["total"] = masks["total"] * curvature_mask_token if "total" in masks else curvature_mask_token
+            curvature_mask = curvature_mask * curvature_mask_token
+        return curvature_mask
+
+    def _compute_fisher_sentence_mask(self, approx_kl, curvature_mask, masks):
+        if self.fisher_sentence_mask_tau != 0.0:
+            curvature_mask_sentence = (approx_kl["sentence"] < self.fisher_sentence_mask_tau).unsqueeze(-1).expand_as(curvature_mask)
+            masks["sentence"] = curvature_mask_sentence
+            masks["total"] = masks["total"] * curvature_mask_sentence if "total" in masks else curvature_mask_sentence
+            curvature_mask = curvature_mask * curvature_mask_sentence
+        return curvature_mask
+
+    def _compute_fisher_global_mask(self, approx_kl, curvature_mask, masks):
+        if self.fisher_global_mask_tau != 0.0:
+            curvature_mask_global = (approx_kl["global"] < self.fisher_global_mask_tau).unsqueeze(-1).expand_as(curvature_mask)
+            masks["global"] = curvature_mask_global
+            masks["total"] = masks["total"] * curvature_mask_global if "total" in masks else curvature_mask_global
+            curvature_mask = curvature_mask * curvature_mask_global
+        return curvature_mask
 
     @profiling_decorator
     def _compute_and_log_softmax_probs_stats(self, softmax_probs, completion_mask, mode):
@@ -1890,15 +1965,16 @@ class GRPOEntropyTrainer(ModifiableGRPOTrainer):
 
         return advantages
     
-    def _compute_final_loss(self, per_token_loss, completion_mask, curvature_estimator, completion_ids):
+    def _compute_final_loss(self, per_token_loss, completion_mask, updated_mask, masks, curvature_estimator, completion_ids):
         mode = "eval" if self.control.should_evaluate else "train"
+        # TODO reuse previous mask instead of computing new ones
         if self.curvature_masking:
-            curvature_mask_hessian, masks_hessian = self._compute_hessian_curvature_mask(curvature_estimator.get("hessian"), completion_mask)
-            curvature_mask_fisher, masks_fisher = self._compute_fisher_curvature_mask(curvature_estimator.get("fisher"), completion_mask)
+            masks_hessian = masks['hessian']
+            masks_fisher = masks['fisher']
             self._log_masking_stats(masks_hessian, masks_fisher, completion_mask, completion_ids, mode)
             
             # Final mask
-            completion_mask = completion_mask * curvature_mask_hessian * curvature_mask_fisher
+            completion_mask = completion_mask * updated_mask
 
         # --- Token-level adjustments ---
         if self.hessian_token_lambda != 0.0:

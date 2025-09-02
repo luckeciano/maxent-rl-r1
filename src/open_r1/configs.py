@@ -87,6 +87,7 @@ class GRPOConfig(trl.GRPOConfig):
     fisher_sentence_mask_tau: float = field(default=0.0, metadata={"help": "The masking coefficient for the fisher at sentence level."})
     hessian_global_mask_tau: float = field(default=0.0, metadata={"help": "The masking coefficient for the hessian at global level."})
     fisher_global_mask_tau: float = field(default=0.0, metadata={"help": "The masking coefficient for the fisher at global level."})
+    sequential_masking: bool = field(default=False, metadata={"help": "Whether to use sequential masking."})
 
 
 
